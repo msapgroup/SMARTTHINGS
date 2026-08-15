@@ -29,28 +29,8 @@ def init_db():
     with db() as c:
         c.executescript("""
         PRAGMA journal_mode=WAL;
-        CREATE TABLE IF NOT EXISTS devices (
-            id INTEGER PRIMARY KEY,
-            mac TEXT NOT NULL UNIQUE,
-            ip TEXT,
-            hostname TEXT,
-            vendor TEXT,
-            name TEXT,
-            device_type TEXT,
-            status TEXT NOT NULL DEFAULT 'unknown',
-            first_seen TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            trusted INTEGER NOT NULL DEFAULT 0,
-            notes TEXT DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY,
-            mac TEXT,
-            event_type TEXT NOT NULL,
-            ip TEXT,
-            created_at TEXT NOT NULL,
-            details TEXT DEFAULT ''
-        );
+        CREATE TABLE IF NOT EXISTS devices (id INTEGER PRIMARY KEY, mac TEXT NOT NULL UNIQUE, ip TEXT, hostname TEXT, vendor TEXT, name TEXT, device_type TEXT, status TEXT NOT NULL DEFAULT 'unknown', first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, trusted INTEGER NOT NULL DEFAULT 0, notes TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, mac TEXT, event_type TEXT NOT NULL, ip TEXT, created_at TEXT NOT NULL, details TEXT DEFAULT '');
         CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
         """)
 
@@ -71,8 +51,7 @@ def local_subnet():
 
 
 def scan():
-    subnet = local_subnet()
-    if not subnet:
+    if not local_subnet():
         return []
     try:
         raw = subprocess.check_output(["arp-scan", "--localnet", "--retry=2"], text=True, stderr=subprocess.STDOUT, timeout=45)
@@ -116,15 +95,14 @@ def main():
     print(f"GODSEYE scanner started; interval={SCAN_INTERVAL}s")
     while True:
         try:
-            force = SCAN_FLAG.exists()
-            if force:
-                SCAN_FLAG.unlink(missing_ok=True)
-            found = scan()
-            record_scan(found)
-            print(f"scan complete: {len(found)} devices")
+            record_scan(scan())
         except Exception as exc:
             print(f"scanner cycle failed: {exc}")
-        time.sleep(1 if SCAN_FLAG.exists() else SCAN_INTERVAL)
+        for _ in range(SCAN_INTERVAL):
+            if SCAN_FLAG.exists():
+                SCAN_FLAG.unlink(missing_ok=True)
+                break
+            time.sleep(1)
 
 
 if __name__ == "__main__":
