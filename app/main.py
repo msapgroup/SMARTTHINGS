@@ -1,6 +1,7 @@
 import datetime as dt
 import hmac
 import os
+import secrets
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, field_validator
 
-from .auth import hash_password, new_token, verify_password
+from .auth import generate_totp_secret, hash_password, new_token, totp_provisioning_uri, verify_password, verify_totp
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("GODSEYE_DB", BASE_DIR / "data" / "godseye.db"))
@@ -51,6 +52,9 @@ WEAK_PASSWORDS = {
 # legal and healthcare contexts).
 PASSWORD_MAX_AGE_DAYS = int(os.environ.get("GODSEYE_PASSWORD_MAX_AGE_DAYS", "0"))
 PASSWORD_HISTORY_COUNT = int(os.environ.get("GODSEYE_PASSWORD_HISTORY_COUNT", "5"))
+
+MFA_PENDING_TTL_SECONDS = int(os.environ.get("GODSEYE_MFA_PENDING_TTL", "300"))  # 5 min to enter a code after password
+MFA_BACKUP_CODE_COUNT = 10
 
 # Optional consent/warning banner shown above the login form. Off by default -
 # set this to your organization's actual approved banner text if one is required;
@@ -216,11 +220,32 @@ def init_db():
             ip TEXT,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS mfa_secrets (
+            user_id INTEGER PRIMARY KEY,
+            secret TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            confirmed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS mfa_backup_codes (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            code_hash TEXT NOT NULL,
+            code_salt TEXT NOT NULL,
+            used_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS mfa_pending (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_pwhistory_user ON password_history(user_id);
+        CREATE INDEX IF NOT EXISTS idx_backupcodes_user ON mfa_backup_codes(user_id);
         """)
         _add_column_if_missing(c, "users", "failed_attempts", "failed_attempts INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(c, "users", "locked_until", "locked_until TEXT")
@@ -321,6 +346,20 @@ class ResetPasswordRequest(BaseModel):
         return v
 
 
+class MfaVerifyRequest(BaseModel):
+    pending_token: str
+    code: str
+
+
+class MfaConfirmRequest(BaseModel):
+    code: str
+
+
+class MfaDisableRequest(BaseModel):
+    current_password: str
+    code: str
+
+
 ALLOWED_WHILE_PASSWORD_RESET_REQUIRED = {
     f"{router_prefix}/auth/change-password",
     f"{router_prefix}/auth/logout",
@@ -380,6 +419,33 @@ def require_admin(user=Depends(get_current_user)):
     return user
 
 
+def _issue_session(c, user_id: int) -> tuple[str, str]:
+    """Creates a session row and returns (session_token, csrf_token). Caller
+    is responsible for setting the cookies via _set_session_cookies."""
+    token, csrf_token = new_token(), new_token()
+    expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SESSION_TTL_SECONDS)).isoformat()
+    c.execute("DELETE FROM sessions WHERE expires_at < ?", (now(),))  # opportunistic cleanup
+    c.execute(
+        "INSERT INTO sessions(token,user_id,created_at,expires_at,last_seen_at) VALUES(?,?,?,?,?)",
+        (token, user_id, now(), expires_at, now()),
+    )
+    return token, csrf_token
+
+
+def _set_session_cookies(response: Response, token: str, csrf_token: str):
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", secure=COOKIE_SECURE, max_age=SESSION_TTL_SECONDS, path="/")
+    response.set_cookie(CSRF_COOKIE, csrf_token, httponly=False, samesite="lax", secure=COOKIE_SECURE, max_age=SESSION_TTL_SECONDS, path="/")
+
+
+def _login_response(user) -> dict:
+    return {
+        "ok": True,
+        "username": user["username"],
+        "role": user["role"],
+        "must_change_password": bool(user["must_change_password"]) or is_password_expired(user["password_changed_at"]),
+    }
+
+
 @app.post(f"{router_prefix}/auth/login")
 def login(payload: LoginRequest, request: Request, response: Response):
     ip = client_ip(request)
@@ -389,7 +455,7 @@ def login(payload: LoginRequest, request: Request, response: Response):
         if user and user["locked_until"]:
             if dt.datetime.fromisoformat(user["locked_until"]) > dt.datetime.now(dt.timezone.utc):
                 audit(c, payload.username, "login_blocked_locked", ip=ip)
-                raise HTTPException(423, f"Account locked due to repeated failed logins. Try again later.")
+                raise HTTPException(423, "Account locked due to repeated failed logins. Try again later.")
             c.execute("UPDATE users SET locked_until=NULL, failed_attempts=0 WHERE id=?", (user["id"],))
 
         if not user or not verify_password(payload.password, user["password_salt"], user["password_hash"]):
@@ -406,23 +472,75 @@ def login(payload: LoginRequest, request: Request, response: Response):
             # endpoint doesn't double as a username-enumeration oracle.
             raise HTTPException(401, "Invalid username or password")
 
-        token, csrf_token = new_token(), new_token()
-        expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SESSION_TTL_SECONDS)).isoformat()
-        c.execute("DELETE FROM sessions WHERE expires_at < ?", (now(),))  # opportunistic cleanup
-        c.execute(
-            "INSERT INTO sessions(token,user_id,created_at,expires_at,last_seen_at) VALUES(?,?,?,?,?)",
-            (token, user["id"], now(), expires_at, now()),
-        )
+        mfa = c.execute("SELECT 1 FROM mfa_secrets WHERE user_id=? AND enabled=1", (user["id"],)).fetchone()
+        if mfa:
+            # Password is correct, but a second factor is still required - don't
+            # issue a session yet. A short-lived pending token carries the user
+            # through to /auth/mfa/verify without exposing a real session cookie.
+            pending_token = new_token()
+            expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=MFA_PENDING_TTL_SECONDS)).isoformat()
+            c.execute("DELETE FROM mfa_pending WHERE expires_at < ?", (now(),))
+            c.execute(
+                "INSERT INTO mfa_pending(token,user_id,created_at,expires_at) VALUES(?,?,?,?)",
+                (pending_token, user["id"], now(), expires_at),
+            )
+            c.execute("UPDATE users SET failed_attempts=0, locked_until=NULL WHERE id=?", (user["id"],))
+            audit(c, user["username"], "login_password_ok_awaiting_mfa", ip=ip)
+            return {"ok": True, "mfa_required": True, "pending_token": pending_token}
+
+        token, csrf_token = _issue_session(c, user["id"])
         c.execute("UPDATE users SET last_login_at=?, failed_attempts=0, locked_until=NULL WHERE id=?", (now(), user["id"]))
         audit(c, user["username"], "login_success", ip=ip)
-    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", secure=COOKIE_SECURE, max_age=SESSION_TTL_SECONDS, path="/")
-    response.set_cookie(CSRF_COOKIE, csrf_token, httponly=False, samesite="lax", secure=COOKIE_SECURE, max_age=SESSION_TTL_SECONDS, path="/")
-    return {
-        "ok": True,
-        "username": user["username"],
-        "role": user["role"],
-        "must_change_password": bool(user["must_change_password"]) or is_password_expired(user["password_changed_at"]),
-    }
+    _set_session_cookies(response, token, csrf_token)
+    return _login_response(user)
+
+
+@app.post(f"{router_prefix}/auth/mfa/verify")
+def mfa_verify(payload: MfaVerifyRequest, request: Request, response: Response):
+    ip = client_ip(request)
+    with db() as c:
+        pending = c.execute("SELECT * FROM mfa_pending WHERE token=?", (payload.pending_token,)).fetchone()
+        if not pending:
+            raise HTTPException(401, "MFA session expired - please log in again")
+        if dt.datetime.fromisoformat(pending["expires_at"]) < dt.datetime.now(dt.timezone.utc):
+            c.execute("DELETE FROM mfa_pending WHERE token=?", (payload.pending_token,))
+            raise HTTPException(401, "MFA session expired - please log in again")
+
+        user = c.execute("SELECT * FROM users WHERE id=?", (pending["user_id"],)).fetchone()
+        mfa = c.execute("SELECT secret FROM mfa_secrets WHERE user_id=? AND enabled=1", (user["id"],)).fetchone()
+
+        code = payload.code.strip()
+        code_ok = bool(mfa) and verify_totp(mfa["secret"], code)
+        backup_used = False
+        if not code_ok:
+            candidates = c.execute(
+                "SELECT id, code_hash, code_salt FROM mfa_backup_codes WHERE user_id=? AND used_at IS NULL",
+                (user["id"],),
+            ).fetchall()
+            for cand in candidates:
+                if verify_password(code, cand["code_salt"], cand["code_hash"]):
+                    c.execute("UPDATE mfa_backup_codes SET used_at=? WHERE id=?", (now(), cand["id"]))
+                    code_ok, backup_used = True, True
+                    break
+
+        if not code_ok:
+            audit(c, user["username"], "mfa_verify_failed", ip=ip)
+            raise HTTPException(401, "Invalid authentication code")
+
+        c.execute("DELETE FROM mfa_pending WHERE token=?", (payload.pending_token,))
+        token, csrf_token = _issue_session(c, user["id"])
+        c.execute("UPDATE users SET last_login_at=? WHERE id=?", (now(), user["id"]))
+        remaining = None
+        if backup_used:
+            remaining = c.execute(
+                "SELECT COUNT(*) FROM mfa_backup_codes WHERE user_id=? AND used_at IS NULL", (user["id"],)
+            ).fetchone()[0]
+        audit(c, user["username"], "mfa_backup_code_used" if backup_used else "login_success_mfa", ip=ip)
+    _set_session_cookies(response, token, csrf_token)
+    resp = _login_response(user)
+    if backup_used:
+        resp["backup_codes_remaining"] = remaining
+    return resp
 
 
 @app.post(f"{router_prefix}/auth/logout")
@@ -443,10 +561,13 @@ def logout(request: Request, response: Response):
 
 @app.get(f"{router_prefix}/auth/me")
 def me(user=Depends(get_current_user)):
+    with db() as c:
+        mfa = c.execute("SELECT enabled FROM mfa_secrets WHERE user_id=?", (user["id"],)).fetchone()
     resp = {
         "username": user["username"],
         "role": user["role"],
         "must_change_password": bool(user["must_change_password"]) or is_password_expired(user["password_changed_at"]),
+        "mfa_enabled": bool(mfa and mfa["enabled"]),
     }
     if PASSWORD_MAX_AGE_DAYS > 0 and user["password_changed_at"]:
         age_days = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(user["password_changed_at"])).total_seconds() / 86400
@@ -476,6 +597,72 @@ def change_password(payload: ChangePasswordRequest, request: Request, user=Depen
     return {"ok": True}
 
 
+@app.post(f"{router_prefix}/auth/mfa/setup")
+def mfa_setup(request: Request, user=Depends(get_current_user)):
+    with db() as c:
+        existing = c.execute("SELECT enabled FROM mfa_secrets WHERE user_id=?", (user["id"],)).fetchone()
+        if existing and existing["enabled"]:
+            raise HTTPException(400, "MFA is already enabled on this account - disable it before setting up a new device")
+        secret = generate_totp_secret()
+        c.execute(
+            "INSERT OR REPLACE INTO mfa_secrets(user_id,secret,enabled,created_at) VALUES(?,?,0,?)",
+            (user["id"], secret, now()),
+        )
+        audit(c, user["username"], "mfa_setup_started", ip=client_ip(request))
+    grouped_secret = " ".join(secret[i:i + 4] for i in range(0, len(secret), 4))
+    return {"ok": True, "secret": grouped_secret, "otpauth_uri": totp_provisioning_uri(secret, user["username"])}
+
+
+@app.post(f"{router_prefix}/auth/mfa/confirm")
+def mfa_confirm(payload: MfaConfirmRequest, request: Request, user=Depends(get_current_user)):
+    with db() as c:
+        row = c.execute("SELECT secret FROM mfa_secrets WHERE user_id=? AND enabled=0", (user["id"],)).fetchone()
+        if not row:
+            raise HTTPException(400, "No pending MFA setup found - call /auth/mfa/setup first")
+        if not verify_totp(row["secret"], payload.code.strip()):
+            audit(c, user["username"], "mfa_confirm_failed", ip=client_ip(request))
+            raise HTTPException(401, "Incorrect code - check your authenticator app and try again")
+        c.execute("UPDATE mfa_secrets SET enabled=1, confirmed_at=? WHERE user_id=?", (now(), user["id"]))
+        c.execute("DELETE FROM mfa_backup_codes WHERE user_id=?", (user["id"],))
+        codes = []
+        for _ in range(MFA_BACKUP_CODE_COUNT):
+            raw = secrets.token_hex(5)
+            code = f"{raw[:5]}-{raw[5:]}"
+            codes.append(code)
+            salt, hashed = hash_password(code)
+            c.execute(
+                "INSERT INTO mfa_backup_codes(user_id,code_hash,code_salt,used_at) VALUES(?,?,?,NULL)",
+                (user["id"], hashed, salt),
+            )
+        audit(c, user["username"], "mfa_enabled", ip=client_ip(request))
+    return {"ok": True, "backup_codes": codes}
+
+
+@app.post(f"{router_prefix}/auth/mfa/disable")
+def mfa_disable(payload: MfaDisableRequest, request: Request, user=Depends(get_current_user)):
+    with db() as c:
+        row = c.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        if not verify_password(payload.current_password, row["password_salt"], row["password_hash"]):
+            raise HTTPException(401, "Current password is incorrect")
+        mfa = c.execute("SELECT secret FROM mfa_secrets WHERE user_id=? AND enabled=1", (user["id"],)).fetchone()
+        if not mfa:
+            raise HTTPException(400, "MFA is not enabled on this account")
+        code = payload.code.strip()
+        code_ok = verify_totp(mfa["secret"], code)
+        if not code_ok:
+            candidates = c.execute(
+                "SELECT id, code_hash, code_salt FROM mfa_backup_codes WHERE user_id=? AND used_at IS NULL",
+                (user["id"],),
+            ).fetchall()
+            code_ok = any(verify_password(code, cand["code_salt"], cand["code_hash"]) for cand in candidates)
+        if not code_ok:
+            raise HTTPException(401, "Invalid authentication code")
+        c.execute("DELETE FROM mfa_secrets WHERE user_id=?", (user["id"],))
+        c.execute("DELETE FROM mfa_backup_codes WHERE user_id=?", (user["id"],))
+        audit(c, user["username"], "mfa_disabled", ip=client_ip(request))
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------------------
 # User management (admin only)
 # ---------------------------------------------------------------------------
@@ -484,7 +671,9 @@ def change_password(payload: ChangePasswordRequest, request: Request, user=Depen
 def list_users(admin=Depends(require_admin)):
     with db() as c:
         rows = c.execute(
-            "SELECT id,username,role,must_change_password,created_at,last_login_at,password_changed_at FROM users ORDER BY id"
+            "SELECT u.id,u.username,u.role,u.must_change_password,u.created_at,u.last_login_at,u.password_changed_at, "
+            "COALESCE((SELECT enabled FROM mfa_secrets m WHERE m.user_id=u.id), 0) AS mfa_enabled "
+            "FROM users u ORDER BY u.id"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -541,6 +730,21 @@ def delete_user(user_id: int, request: Request, admin=Depends(require_admin)):
         c.execute("DELETE FROM users WHERE id=?", (user_id,))
         c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         audit(c, admin["username"], "user_deleted", target=target["username"], ip=client_ip(request))
+    return {"ok": True}
+
+
+@app.post(f"{router_prefix}/users/{{user_id}}/mfa/reset")
+def admin_reset_mfa(user_id: int, request: Request, admin=Depends(require_admin)):
+    # For lost-device recovery: an admin can turn MFA off for another account
+    # (never on - enrollment requires access to that person's own authenticator
+    # app), after which the user re-enrolls a new device themselves.
+    with db() as c:
+        target = c.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(404, "User not found")
+        c.execute("DELETE FROM mfa_secrets WHERE user_id=?", (user_id,))
+        c.execute("DELETE FROM mfa_backup_codes WHERE user_id=?", (user_id,))
+        audit(c, admin["username"], "mfa_reset_by_admin", target=target["username"], ip=client_ip(request))
     return {"ok": True}
 
 
@@ -729,6 +933,17 @@ DASHBOARD = r'''<!doctype html>
     </form>
   </div>
 </div>
+<div id="mfaLoginOverlay" class="overlay" style="display:none">
+  <div class="authcard">
+    <h2>Two-factor authentication</h2>
+    <div class="muted">Enter the 6-digit code from your authenticator app, or a backup code.</div>
+    <form id="mfaLoginForm" onsubmit="return doMfaVerify(event)">
+      <input class="input" id="mfaCode" placeholder="123456 or backup code" autocomplete="one-time-code" required>
+      <div class="err" id="mfaLoginErr"></div>
+      <button class="primary" type="submit">Verify</button>
+    </form>
+  </div>
+</div>
 <div id="app" style="display:none">
 <div class="healthbar" id="healthbar"></div>
 <header><div class="brand"><div class="eye">◉</div><div><b>GODSEYE</b><div class="muted">LOCAL NETWORK INTELLIGENCE</div></div></div>
@@ -739,9 +954,10 @@ DASHBOARD = r'''<!doctype html>
 <div class="toolbar"><input id="search" class="input" placeholder="Search name, IP, MAC, hostname or vendor…" oninput="loadDevices()"><select id="status" class="filter" onchange="loadDevices()"><option value="">All statuses</option><option value="online">Online</option><option value="suspected_offline">Suspected offline</option><option value="offline">Offline</option></select><select id="classification" class="filter" onchange="loadDevices()"><option value="">All classifications</option><option value="new">New</option><option value="known">Known</option><option value="investigate">Investigate</option><option value="ignored">Ignored</option></select></div>
 <section class="panel"><h2>Devices</h2><div style="overflow:auto"><table><thead><tr><th>Status</th><th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th><th>Classification</th></tr></thead><tbody id="devices"></tbody></table></div></section>
 <section class="panel"><h2>Recent Activity</h2><div style="overflow:auto"><table><thead><tr><th>Time</th><th>Event</th><th>Device</th><th>IP</th><th>Details</th></tr></thead><tbody id="events"></tbody></table></div></section>
+<section class="panel"><h2>Two-Factor Authentication</h2><div id="mfaStatus" style="padding:16px 18px"></div></section>
 <section class="panel" id="usersPanel" style="display:none"><h2>Users</h2>
 <form class="userForm" onsubmit="return createUser(event)"><input class="input" id="newUsername" placeholder="Username" required><input class="input" id="newUserPassword" type="password" placeholder="Password (min __MIN_PASSWORD_LENGTH__ chars)" required minlength="__MIN_PASSWORD_LENGTH__"><select class="filter" id="newUserRole"><option value="readonly">Read-only</option><option value="admin">Admin</option></select><button class="primary" type="submit">Add user</button></form>
-<div style="overflow:auto"><table><thead><tr><th>Username</th><th>Role</th><th>Created</th><th>Last login</th><th>Password changed</th><th>Must change PW</th><th></th></tr></thead><tbody id="users"></tbody></table></div>
+<div style="overflow:auto"><table><thead><tr><th>Username</th><th>Role</th><th>Created</th><th>Last login</th><th>Password changed</th><th>Must change PW</th><th>MFA</th><th></th></tr></thead><tbody id="users"></tbody></table></div>
 </section>
 <section class="panel" id="auditPanel" style="display:none"><h2>Audit Log</h2>
 <div style="overflow:auto"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th><th>IP</th></tr></thead><tbody id="auditRows"></tbody></table></div>
@@ -752,22 +968,30 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&
 const CLASS_CYCLE={new:'known',known:'ignored',ignored:'investigate',investigate:'new'};
 const CLASS_LABEL={new:'New',known:'Known',ignored:'Ignored',investigate:'Investigate'};
 let ME=null;
+let PENDING_MFA_TOKEN=null;
 function getCookie(name){const m=document.cookie.match('(?:^|; )'+name+'=([^;]*)');return m?decodeURIComponent(m[1]):null}
 async function json(url,opt={}){opt.headers=opt.headers||{};if(opt.method&&opt.method!=='GET'){opt.headers['X-CSRF-Token']=getCookie('godseye_csrf')||''}let r=await fetch(url,opt);if(r.status===401){showLogin();throw new Error('unauthenticated')}if(!r.ok){let t=await r.text();throw new Error(t)}return r.status===204?null:r.json()}
-function showLogin(){document.getElementById('app').style.display='none';document.getElementById('pwOverlay').style.display='none';document.getElementById('authOverlay').style.display='grid'}
-function showApp(){document.getElementById('authOverlay').style.display='none';document.getElementById('pwOverlay').style.display='none';document.getElementById('app').style.display='block'}
-async function doLogin(e){e.preventDefault();const err=document.getElementById('loginErr');err.textContent='';try{let r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:loginUser.value,password:loginPass.value})});if(r.status===423){err.textContent='Account temporarily locked due to repeated failed logins. Try again later.';return false}if(!r.ok){err.textContent='Invalid username or password';return false}let data=await r.json();if(data.must_change_password){document.getElementById('authOverlay').style.display='none';document.getElementById('pwOverlay').style.display='grid';return false}await boot()}catch(e){err.textContent='Sign-in failed'}return false}
+function showLogin(){document.getElementById('app').style.display='none';document.getElementById('pwOverlay').style.display='none';document.getElementById('mfaLoginOverlay').style.display='none';document.getElementById('authOverlay').style.display='grid'}
+function showApp(){document.getElementById('authOverlay').style.display='none';document.getElementById('pwOverlay').style.display='none';document.getElementById('mfaLoginOverlay').style.display='none';document.getElementById('app').style.display='block'}
+async function doLogin(e){e.preventDefault();const err=document.getElementById('loginErr');err.textContent='';try{let r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:loginUser.value,password:loginPass.value})});if(r.status===423){err.textContent='Account temporarily locked due to repeated failed logins. Try again later.';return false}if(!r.ok){err.textContent='Invalid username or password';return false}let data=await r.json();if(data.mfa_required){PENDING_MFA_TOKEN=data.pending_token;document.getElementById('authOverlay').style.display='none';document.getElementById('mfaLoginOverlay').style.display='grid';return false}if(data.must_change_password){document.getElementById('authOverlay').style.display='none';document.getElementById('pwOverlay').style.display='grid';return false}await boot()}catch(e){err.textContent='Sign-in failed'}return false}
+async function doMfaVerify(e){e.preventDefault();const err=document.getElementById('mfaLoginErr');err.textContent='';try{let r=await fetch('/api/v1/auth/mfa/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pending_token:PENDING_MFA_TOKEN,code:mfaCode.value.trim()})});if(!r.ok){err.textContent='Invalid code';return false}let data=await r.json();PENDING_MFA_TOKEN=null;if(data.must_change_password){document.getElementById('mfaLoginOverlay').style.display='none';document.getElementById('pwOverlay').style.display='grid';return false}await boot()}catch(e){err.textContent='Verification failed'}return false}
 function openChangePassword(){document.getElementById('pwOverlay').style.display='grid'}
 async function doChangePassword(e){e.preventDefault();const err=document.getElementById('pwErr');err.textContent='';try{await json('/api/v1/auth/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:curPass.value,new_password:newPass.value})});await boot()}catch(e){err.textContent='Could not change password — check your current password'}return false}
 async function logout(){await fetch('/api/v1/auth/logout',{method:'POST',headers:{'X-CSRF-Token':getCookie('godseye_csrf')||''}});showLogin()}
 async function loadDevices(){let q=new URLSearchParams();if(search.value)q.set('search',search.value);if(status.value)q.set('status',status.value);if(classification.value)q.set('classification',classification.value);let d=await json('/api/v1/devices?'+q);const canEdit=ME&&ME.role==='admin';devices.innerHTML=d.length?d.map(x=>`<tr><td class="${esc(x.status)}"><span class="dot">●</span> ${esc(x.status).replace('_',' ')}</td><td><div class="name">${esc(x.name||x.hostname||'Unknown device')}</div><div class="muted">${esc(x.device_type||'Unclassified')}</div></td><td>${esc(x.ip)}</td><td>${esc(x.mac)}</td><td>${esc(x.vendor||'—')}</td><td><button class="pill ${esc(x.classification)}" ${canEdit?`onclick="cycleClass(${x.id},'${x.classification}')"`:'disabled'}>${CLASS_LABEL[x.classification]||x.classification}</button></td></tr>`).join(''):'<tr><td colspan="6" class="empty">No devices match this filter.</td></tr>'}
-async function loadUsers(){if(!ME||ME.role!=='admin'){usersPanel.style.display='none';return}usersPanel.style.display='block';let u=await json('/api/v1/users');users.innerHTML=u.map(x=>`<tr><td>${esc(x.username)}</td><td><span class="pill ${esc(x.role)}">${esc(x.role)}</span></td><td>${esc(new Date(x.created_at).toLocaleDateString())}</td><td>${x.last_login_at?esc(new Date(x.last_login_at).toLocaleString()):'never'}</td><td>${x.password_changed_at?esc(new Date(x.password_changed_at).toLocaleDateString()):'—'}</td><td>${x.must_change_password?'yes':'no'}</td><td>${x.username===ME.username?'':`<button class="link" onclick="removeUser(${x.id},'${esc(x.username)}')">Remove</button>`}</td></tr>`).join('')}
+async function loadUsers(){if(!ME||ME.role!=='admin'){usersPanel.style.display='none';return}usersPanel.style.display='block';let u=await json('/api/v1/users');users.innerHTML=u.map(x=>`<tr><td>${esc(x.username)}</td><td><span class="pill ${esc(x.role)}">${esc(x.role)}</span></td><td>${esc(new Date(x.created_at).toLocaleDateString())}</td><td>${x.last_login_at?esc(new Date(x.last_login_at).toLocaleString()):'never'}</td><td>${x.password_changed_at?esc(new Date(x.password_changed_at).toLocaleDateString()):'—'}</td><td>${x.must_change_password?'yes':'no'}</td><td>${x.mfa_enabled?'yes':'no'}</td><td>${x.username===ME.username?'':`<button class="link" onclick="removeUser(${x.id},'${esc(x.username)}')">Remove</button>${x.mfa_enabled?` <button class="link" onclick="resetUserMfa(${x.id},'${esc(x.username)}')">Reset MFA</button>`:''}`}</td></tr>`).join('')}
 async function loadAudit(){if(!ME||ME.role!=='admin'){auditPanel.style.display='none';return}auditPanel.style.display='block';let a=await json('/api/v1/audit?limit=50');auditRows.innerHTML=a.length?a.map(x=>`<tr><td>${esc(new Date(x.created_at).toLocaleString())}</td><td>${esc(x.actor)}</td><td><span class="pill">${esc(x.action)}</span></td><td>${esc(x.target||'—')}</td><td>${esc(x.details||'')}</td><td>${esc(x.ip||'—')}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">No audit entries yet.</td></tr>'}
+async function loadSecurity(){const el=document.getElementById('mfaStatus');if(ME.mfa_enabled){el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#50e3a4">enabled</b> on this account.</div><button class="link" style="margin-top:10px" onclick="startMfaDisable()">Disable MFA</button>`}else{el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#f7c948">not enabled</b>. Add it for a second layer of protection beyond your password.</div><button class="primary" style="margin-top:10px" onclick="startMfaSetup()">Set up MFA</button>`}}
+async function startMfaSetup(){let data=await json('/api/v1/auth/mfa/setup',{method:'POST'});const el=document.getElementById('mfaStatus');el.innerHTML=`<div class="muted">In Google Authenticator (or any TOTP app), choose "Enter a setup key" and type this in:</div><div style="font-family:monospace;font-size:16px;background:#0d141f;border:1px solid #2b3a52;border-radius:8px;padding:10px;margin:10px 0;word-break:break-all">${esc(data.secret)}</div><div class="muted" style="font-size:11px;word-break:break-all">${esc(data.otpauth_uri)}</div><form onsubmit="return confirmMfaSetup(event)" style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap"><input class="input" id="mfaConfirmCode" placeholder="Enter 6-digit code to confirm" required style="flex:1;min-width:180px"><button class="primary" type="submit">Confirm</button></form><div class="err" id="mfaSetupErr"></div>`}
+async function confirmMfaSetup(e){e.preventDefault();const err=document.getElementById('mfaSetupErr');err.textContent='';try{let data=await json('/api/v1/auth/mfa/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:mfaConfirmCode.value.trim()})});const el=document.getElementById('mfaStatus');el.innerHTML=`<div class="muted" style="color:#50e3a4">MFA enabled. Save these one-time backup codes somewhere safe — each works once if you lose access to your authenticator app:</div><div style="font-family:monospace;background:#0d141f;border:1px solid #2b3a52;border-radius:8px;padding:10px;margin:10px 0">${data.backup_codes.map(esc).join('<br>')}</div><button class="primary" onclick="boot()">Done</button>`;ME=await json('/api/v1/auth/me')}catch(e){err.textContent='Incorrect code — try again'}return false}
+async function startMfaDisable(){const el=document.getElementById('mfaStatus');el.innerHTML=`<form onsubmit="return confirmMfaDisable(event)" style="display:flex;flex-direction:column;gap:8px;max-width:320px"><input class="input" id="mfaDisablePw" type="password" placeholder="Current password" required><input class="input" id="mfaDisableCode" placeholder="6-digit code or backup code" required><button class="danger" type="submit">Disable MFA</button><div class="err" id="mfaDisableErr"></div></form>`}
+async function confirmMfaDisable(e){e.preventDefault();const err=document.getElementById('mfaDisableErr');err.textContent='';try{await json('/api/v1/auth/mfa/disable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:mfaDisablePw.value,code:mfaDisableCode.value.trim()})});ME=await json('/api/v1/auth/me');loadSecurity()}catch(e){err.textContent='Could not disable MFA — check password and code'}return false}
+async function resetUserMfa(id,username){if(!confirm('Reset MFA for "'+username+'"? They will need to set it up again.'))return;await json('/api/v1/users/'+id+'/mfa/reset',{method:'POST'});await loadUsers()}
 async function createUser(e){e.preventDefault();try{await json('/api/v1/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:newUsername.value,password:newUserPassword.value,role:newUserRole.value})});newUsername.value='';newUserPassword.value='';await loadUsers()}catch(e){alert('Could not create user: '+e.message)}return false}
 async function removeUser(id,username){if(!confirm('Remove user "'+username+'"?'))return;await json('/api/v1/users/'+id,{method:'DELETE'});await loadUsers()}
 async function load(){let h=await json('/api/v1/health');total.textContent=h.total;online.textContent=h.online;unknown.textContent=h.needs_review;eventsCount.textContent=h.events;updated.textContent='Last refreshed '+new Date().toLocaleTimeString();lastScan.textContent=h.scanner.detail;const hb=document.getElementById('healthbar');if(!h.scanner.healthy){hb.className='healthbar bad';hb.textContent='⚠ Scanner unhealthy — '+h.scanner.detail;hb.style.display='block'}else{hb.style.display='none'}await loadDevices();let e=await json('/api/v1/events?limit=30');events.innerHTML=e.length?e.map(x=>`<tr><td>${esc(new Date(x.created_at).toLocaleString())}</td><td><span class="pill">${esc(x.event_type)}</span></td><td>${esc(x.mac)}</td><td>${esc(x.ip)}</td><td>${esc(x.details)}</td></tr>`).join(''):'<tr><td colspan="5" class="empty">No activity yet.</td></tr>'}
 async function cycleClass(id,current){await json('/api/v1/devices/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({classification:CLASS_CYCLE[current]||'new'})});load()}
 async function scan(){await json('/api/v1/scan',{method:'POST'});updated.textContent='Scan requested…';setTimeout(load,3000)}
-async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';showApp();await load();await loadUsers();await loadAudit();setInterval(load,10000)}
+async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';showApp();await load();await loadUsers();await loadAudit();await loadSecurity();setInterval(load,10000)}
 boot();
 </script></body></html>'''

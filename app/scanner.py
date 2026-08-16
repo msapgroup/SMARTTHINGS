@@ -109,11 +109,32 @@ def init_db():
             ip TEXT,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS mfa_secrets (
+            user_id INTEGER PRIMARY KEY,
+            secret TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            confirmed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS mfa_backup_codes (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            code_hash TEXT NOT NULL,
+            code_salt TEXT NOT NULL,
+            used_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS mfa_pending (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_pwhistory_user ON password_history(user_id);
+        CREATE INDEX IF NOT EXISTS idx_backupcodes_user ON mfa_backup_codes(user_id);
         """)
         # Additive, idempotent migrations for installs created before these columns existed.
         # (A real migration framework - versioned, ordered scripts - belongs on the roadmap;

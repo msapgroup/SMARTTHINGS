@@ -2,7 +2,7 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.5
+## Current release: 0.6
 
 - Automatic ARP LAN discovery with `arp-scan`
 - Persistent SQLite inventory
@@ -10,6 +10,7 @@
 - Three-state device lifecycle (online / suspected offline / offline) that tolerates a missed scan or two before flagging a device gone
 - Device classification (new / known / ignored / investigate) instead of a blunt trusted flag
 - Session-based authentication with admin and read-only roles; forced password change on first login
+- Two-factor authentication (TOTP - Google Authenticator, Authy, 1Password, etc.) with one-time backup codes
 - Account lockout after repeated failed logins, idle session timeout, CSRF protection, security headers
 - Optional password rotation (30/90/180 days) and password history/reuse prevention
 - Admin-viewable audit log of logins, password changes, and administrative actions
@@ -21,6 +22,28 @@
 - Manual scan requests (admin only)
 - Privilege separation: scanner is isolated from the web application
 - systemd services for automatic startup/restart
+
+## Screenshots
+
+<p>
+  <img src="docs/screenshots/login.png" width="400" alt="Login screen"><br>
+  <em>Login</em>
+</p>
+<p>
+  <img src="docs/screenshots/mfa-setup.png" width="700" alt="Two-factor authentication setup"><br>
+  <em>Two-factor setup - scan or enter the key into Google Authenticator or any TOTP app</em>
+</p>
+<p>
+  <img src="docs/screenshots/dashboard-full.png" width="700" alt="Full dashboard"><br>
+  <em>Dashboard - devices, activity, security panel, users, and audit log</em>
+</p>
+
+These are real renders of the actual dashboard HTML/CSS/JavaScript shipped
+in `app/main.py`, served against realistic sample data rather than a live
+Raspberry Pi deployment - useful for seeing what the UI looks like without
+having hardware to hand. If you'd like to swap these for screenshots of
+your own running instance, they're easy to regenerate: run GODSEYE, log
+in, and capture the browser window.
 
 ## Architecture
 
@@ -73,6 +96,24 @@ curl -X POST http://<pi-ip>:8080/api/v1/users \
 Roles:
 - **admin** — full access: view everything, change device classification, trigger scans, manage users
 - **readonly** — can view devices, events, and health, but cannot change anything
+
+### Two-factor authentication
+
+Any account (admin or read-only) can enable TOTP-based two-factor
+authentication from the **Two-Factor Authentication** panel on the
+dashboard: scan the setup key into Google Authenticator, Authy,
+1Password, or any standard TOTP app, confirm with a code, and save the
+10 one-time backup codes shown afterward (each works once, for when the
+device with your authenticator app isn't available). Once enabled, login
+requires the password *and* a current code.
+
+If a device with an enrolled authenticator is lost, an admin can reset
+MFA for that account from the Users panel — this turns MFA off so the
+user can re-enroll; nobody but the account holder can turn it back on,
+since that requires access to their own authenticator app.
+
+MFA is implemented with the standard TOTP algorithm (RFC 6238) using only
+the Python standard library — no external dependency, no cloud service.
 
 ## Configuration
 
@@ -179,7 +220,6 @@ substitute for one.
 
 Near-term, following the phased plan in `docs/roadmap.md`:
 
-- TOTP/MFA as a second authentication factor
 - Alert/rule engine on top of the new event severity field
 - OUI/manufacturer lookup and better automatic device classification
 - ntfy / Telegram / email notification plugins
