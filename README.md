@@ -177,9 +177,11 @@ those gaps matter for anyone evaluating this for a regulated environment.
   demonstrated security benefit. `GODSEYE_PASSWORD_MAX_AGE_DAYS` (e.g. 30,
   90, or 180) is available for organizations whose own policy or a
   different, still-current compliance baseline requires it regardless.
-- **Not implemented:** multi-factor authentication (800-63B recommends
-  MFA at AAL2+; GODSEYE is currently single-factor password auth only —
-  on the roadmap).
+- **Multi-factor authentication is now supported** (as of 0.6): TOTP,
+  compatible with Google Authenticator, Authy, 1Password, etc., satisfying
+  800-63B's recommendation of a second factor at AAL2. It's opt-in per
+  account rather than enforced tenant-wide — enforcing it for every
+  account is a reasonable next step if that matters for your deployment.
 
 **General technical safeguards (map loosely onto NIST 800-53 control
 families and HIPAA Security Rule technical safeguards, §164.312):**
@@ -215,6 +217,32 @@ obligation but don't discharge it on their own.
 **If you're evaluating GODSEYE for a regulated deployment:** treat this
 section as a starting checklist for your own risk assessment, not a
 substitute for one.
+
+## Remote access
+
+GODSEYE listens on your LAN only by design — it has no public-internet
+exposure and no remote-access feature built in. **Don't port-forward
+straight to it.** If you want to reach your dashboard away from home, put
+a VPN in front of it instead:
+
+| Option | Trade-off |
+| --- | --- |
+| **WireGuard**, self-hosted | Fully self-contained (fits GODSEYE's local-first ethos), fast, modern, built into the Linux kernel. You manage key exchange and NAT traversal yourself. |
+| **Tailscale** (WireGuard-based mesh) | Easiest setup by far — no port forwarding, no cert management. Free Personal tier covers up to 6 users with unlimited devices, which is plenty for a household. Trade-off: relies on Tailscale's cloud coordination service to establish connections (actual traffic is still end-to-end encrypted and typically peer-to-peer, not routed through their servers). [Headscale](https://github.com/juanfont/headscale) is an open-source, self-hostable alternative if you want the same mesh model without trusting a third party's coordination plane. |
+| **OpenVPN** | Mature and fully self-hostable, still a fine choice, but heavier to set up and maintain (certificate authority, `.ovpn` client configs) than WireGuard for the same result. Worth it mainly if you're already standardized on it. |
+
+For most home setups, **WireGuard or Tailscale** will get you working
+remote access faster and with a smaller attack surface than OpenVPN.
+
+**Running GODSEYE at more than one location?** A mesh VPN (Tailscale or
+self-hosted WireGuard/Headscale) is exactly the right tool to reach each
+site's dashboard from anywhere — add each Pi as a node on the same
+mesh, then bookmark each instance's private VPN address. That gets you
+access to every location, but GODSEYE itself doesn't currently aggregate
+multiple sites into one unified view — each instance's dashboard only
+shows its own local network. A true multi-site dashboard (one screen,
+all locations) would be a separate feature to build; if that's something
+you want, it's a reasonable roadmap addition.
 
 ## Roadmap
 
