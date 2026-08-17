@@ -2,7 +2,7 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.7
+## Current release: 0.8
 
 - Automatic ARP LAN discovery with `arp-scan`
 - Persistent SQLite inventory
@@ -10,12 +10,12 @@
 - Three-state device lifecycle (online / suspected offline / offline) that tolerates a missed scan or two before flagging a device gone
 - Device classification (new / known / ignored / investigate) instead of a blunt trusted flag
 - Outbound alerting: generic webhook (PSA/ticketing, Power Automate, Slack, Teams, etc.), ntfy, and email, with per-scan storm protection
-- Session-based authentication with admin and read-only roles; forced password change on first login
+- Session-based authentication with admin and read-only roles; grace-period password change (default 2 days) for admin-set passwords instead of an immediate hard block
 - Two-factor authentication (TOTP - Google Authenticator, Authy, 1Password, etc.) with one-time backup codes
 - Account lockout after repeated failed logins, idle session timeout, CSRF protection, security headers
 - Optional password rotation (30/90/180 days) and password history/reuse prevention
 - Admin-viewable audit log of logins, password changes, and administrative actions
-- TLS by default (Caddy reverse proxy, auto-configured by `install.sh`) and a randomly generated admin password at install time — no fixed default credentials shipped
+- TLS via Caddy reverse proxy (auto-installed by `install.sh`, never blocks core app startup if it fails) and a randomly generated admin password at install time — no fixed default credentials shipped
 - Device names, type and notes
 - Search, status and classification filtering
 - Activity history
@@ -74,22 +74,29 @@ Then open `http://<raspberry-pi-ip>:8080` from a device on your LAN.
 
 `install.sh` generates a random admin password at install time and
 prints it once — there's no fixed, well-known default shipped in the
-code at all as of 0.6. The generated credentials are saved to
-`/etc/godseye.env` (root-only, `chmod 600`) in case you need them again,
-and are also enforced server-side to require a password change on first
-login regardless, as defense in depth.
+code at all as of 0.7. The generated credentials are saved to
+`/etc/godseye.env` (root-only, `chmod 600`) in case you need them again.
 
 - Username: `GodsEye` (override with `GODSEYE_ADMIN_USER`)
 - Password: randomly generated, printed once at install — or set
   `GODSEYE_ADMIN_PASSWORD` yourself before running `install.sh` (e.g. as
   a hard step in a client-provisioning template) to skip the random one
 
+**Password changes an admin sets on your behalf** — the initial seeded
+password, a new account an admin creates for you, or a password an admin
+resets — come with a **grace period** (`GODSEYE_PASSWORD_CHANGE_GRACE_DAYS`,
+default 2 days) rather than an immediate hard block. You can log in and
+use the app normally right away; a dismissible banner reminds you to set
+your own password, and it's only actually *enforced* — blocking
+everything except the change-password screen — once the deadline passes
+without you changing it. Set `GODSEYE_PASSWORD_CHANGE_GRACE_DAYS=0` to go
+back to the stricter immediate-block behavior.
+
 If you're running the app directly in development rather than through
 `install.sh` (`python3 -m app` with no env file), the same env vars still
 work the same way, but nothing generates a random password for you in
 that path — set `GODSEYE_ADMIN_PASSWORD` yourself, or expect the fallback
-default of `GodsEye`/`GodsEye`, which — same as ever — forces a change on
-first login.
+default of `GodsEye`/`GodsEye`.
 
 Once logged in as an admin, add additional accounts from the **Users**
 panel on the dashboard, or via the API:
@@ -136,7 +143,8 @@ Set these as `Environment=` lines in the systemd unit files (or export them befo
 | `GODSEYE_OFFLINE_THRESHOLD` | `3` | scanner | Consecutive missed scans before a device is marked offline and a disconnect event is logged |
 | `GODSEYE_HEARTBEAT_STALE_AFTER` | `180` | web | Seconds since the scanner's last successful run before the dashboard reports it unhealthy |
 | `GODSEYE_ADMIN_USER` | `GodsEye` | web | Username seeded for the first admin account (only used when the `users` table is empty) |
-| `GODSEYE_ADMIN_PASSWORD` | `GodsEye` | web | Password seeded for the first admin account — must be changed on first login regardless |
+| `GODSEYE_ADMIN_PASSWORD` | `GodsEye` (dev) / randomly generated (via `install.sh`) | web | Password seeded for the first admin account |
+| `GODSEYE_PASSWORD_CHANGE_GRACE_DAYS` | `2` | web | Days before an admin-set password (initial seed, new account, admin reset) is actually *enforced* — the account works normally with a reminder banner until then. `0` = enforce immediately |
 | `GODSEYE_SESSION_TTL` | `604800` (7 days) | web | Absolute session lifetime in seconds |
 | `GODSEYE_IDLE_TIMEOUT` | `900` (15 min) | web | Session is invalidated after this many seconds of inactivity, independent of the absolute TTL |
 | `GODSEYE_MAX_FAILED_ATTEMPTS` | `5` | web | Failed logins before an account is temporarily locked |
@@ -144,7 +152,7 @@ Set these as `Environment=` lines in the systemd unit files (or export them befo
 | `GODSEYE_MIN_PASSWORD_LENGTH` | `12` | web | Minimum password length (NIST 800-63B requires ≥8; longer is encouraged over composition rules) |
 | `GODSEYE_PASSWORD_MAX_AGE_DAYS` | `0` (disabled) | web | Force a password change after N days — see the note below before enabling |
 | `GODSEYE_PASSWORD_HISTORY_COUNT` | `5` | web | How many previous passwords are remembered and blocked from reuse |
-| `GODSEYE_COOKIE_SECURE` | `false` (`true` when installed via `install.sh`) | web | Marks cookies `Secure` — needed when GODSEYE sits behind TLS |
+| `GODSEYE_COOKIE_SECURE` | `false` | web | Marks cookies `Secure` — **only set this `true` if you will *exclusively* access GODSEYE over HTTPS.** Browsers silently refuse to send `Secure` cookies over plain HTTP, so enabling this breaks login on the plain `:8080` URL. `install.sh` does *not* set this automatically, precisely because it also gives you that plain HTTP URL as a valid access path. |
 | `GODSEYE_LOGIN_BANNER` | *(empty)* | web | Optional text shown above the login form (e.g. an organizational consent/warning banner) |
 | `GODSEYE_WEBHOOK_URL` | *(empty, disabled)* | scanner | Generic outbound webhook — POSTs a JSON event payload here |
 | `GODSEYE_WEBHOOK_MIN_SEVERITY` | `warning` | scanner | Minimum event severity (`info`/`warning`/`critical`) that triggers the webhook |
@@ -247,14 +255,19 @@ families and HIPAA Security Rule technical safeguards, §164.312):**
   scans, viewable in an admin-only dashboard panel
 - Automatic logoff — idle session timeout (configurable)
 - Integrity — CSRF protection on all state-changing requests
-- **Encryption in transit is now on by default** (as of 0.6): `install.sh`
-  installs Caddy as a reverse proxy in front of GODSEYE and terminates TLS
-  automatically, so there's no "remembered to configure it" failure mode.
-  Since GODSEYE has no public DNS name (see Remote Access below), the
-  certificate is self-signed via Caddy's internal CA rather than a
-  publicly-trusted one — browsers will warn on first visit until you run
-  `sudo caddy trust` on each client device. `GODSEYE_COOKIE_SECURE` is set
-  automatically alongside it.
+- **A TLS reverse proxy (Caddy) is installed by `install.sh` automatically**
+  (as of 0.6), fronting GODSEYE on `:8443` so there's a working HTTPS
+  option without you having to set it up. Since GODSEYE has no public DNS
+  name (see Remote Access below), the certificate is self-signed via
+  Caddy's internal CA rather than a publicly-trusted one — browsers will
+  warn on first visit until you run `sudo caddy trust` on each client
+  device. **`GODSEYE_COOKIE_SECURE` is deliberately *not* enabled
+  automatically alongside it**, because the plain `http://<ip>:8080` URL
+  is also a valid, intended access path (e.g. over a VPN where TLS feels
+  unnecessary) — and browsers silently refuse to send `Secure` cookies
+  over plain HTTP, which would break login on that URL. If you will
+  *only* ever use the HTTPS URL, set `GODSEYE_COOKIE_SECURE=true`
+  yourself in `/etc/godseye.env` for the extra protection.
 - **Encryption at rest is deliberately *not* something this install
   script can safely automate**, and it's worth explaining why rather than
   papering over it. Full-disk encryption (LUKS) needs a secret to unlock
