@@ -7,10 +7,14 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import notifications
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("GODSEYE_DB", BASE_DIR / "data" / "godseye.db"))
 SCAN_INTERVAL = int(os.environ.get("GODSEYE_SCAN_INTERVAL", "60"))
 SCAN_FLAG = DB_PATH.parent / "scan-now"
+
+dispatcher = notifications.NotificationDispatcher()
 
 # Consecutive missed scans before a device moves online -> suspected_offline -> offline.
 # A single missed scan (Wi-Fi roam, sleeping laptop, one dropped probe) should not
@@ -185,6 +189,8 @@ def _log_event(c, mac, event_type, ip, timestamp, details, severity="info"):
         "INSERT INTO events(mac,event_type,ip,created_at,details,severity) VALUES(?,?,?,?,?,?)",
         (mac, event_type, ip, timestamp, details, severity),
     )
+    return {"mac": mac, "event_type": event_type, "ip": ip, "created_at": timestamp,
+            "details": details, "severity": severity}
 
 
 def record_scan(found):
@@ -194,9 +200,14 @@ def record_scan(found):
     roaming, sleeping devices, one dropped ARP probe) without generating
     false disconnect events, while still surfacing genuinely offline devices
     after OFFLINE_THRESHOLD consecutive misses.
+
+    Notifications (webhook/ntfy/email) are dispatched after the database
+    transaction closes, so a slow or unreachable notification endpoint
+    never holds the SQLite write lock open.
     """
     timestamp = now()
     found_macs = set()
+    fired_events = []
     with db() as c:
         existing = {r["mac"]: r for r in c.execute("SELECT * FROM devices")}
         for d in found:
@@ -209,12 +220,12 @@ def record_scan(found):
                     "VALUES(?,?,?,?,?,?,?,0)",
                     (mac, d["ip"], d["vendor"], "online", timestamp, timestamp, "new"),
                 )
-                _log_event(c, mac, "new_device", d["ip"], timestamp, "New device discovered", severity="warning")
+                fired_events.append(_log_event(c, mac, "new_device", d["ip"], timestamp, "New device discovered", severity="warning"))
             else:
                 if old["ip"] != d["ip"]:
-                    _log_event(c, mac, "ip_changed", d["ip"], timestamp, f"IP changed from {old['ip']} to {d['ip']}")
+                    fired_events.append(_log_event(c, mac, "ip_changed", d["ip"], timestamp, f"IP changed from {old['ip']} to {d['ip']}"))
                 elif old["status"] != "online":
-                    _log_event(c, mac, "connected", d["ip"], timestamp, "Device returned to the network")
+                    fired_events.append(_log_event(c, mac, "connected", d["ip"], timestamp, "Device returned to the network"))
                 c.execute(
                     "UPDATE devices SET ip=?,vendor=?,status='online',last_seen=?,missed_scans=0 WHERE mac=?",
                     (d["ip"], d["vendor"] or old["vendor"], timestamp, mac),
@@ -229,8 +240,18 @@ def record_scan(found):
                 c.execute("UPDATE devices SET missed_scans=? WHERE mac=?", (missed, mac))
             if old["status"] != "offline" and missed >= OFFLINE_THRESHOLD:
                 c.execute("UPDATE devices SET status='offline',missed_scans=? WHERE mac=?", (missed, mac))
-                _log_event(c, mac, "disconnected", old["ip"], timestamp,
-                           f"Not seen for {missed} consecutive scans", severity="warning")
+                fired_events.append(_log_event(c, mac, "disconnected", old["ip"], timestamp,
+                                    f"Not seen for {missed} consecutive scans", severity="warning"))
+
+    suppressed = 0
+    dispatcher.reset()
+    for event in fired_events:
+        if not dispatcher.notify(event):
+            suppressed += 1
+    if suppressed:
+        print(f"[GODSEYE] {suppressed} notification(s) suppressed this scan cycle "
+              f"(GODSEYE_MAX_NOTIFICATIONS_PER_SCAN={notifications.MAX_NOTIFICATIONS_PER_SCAN}) - "
+              "events were still recorded, just not pushed out, to avoid an alert storm")
 
 
 def record_heartbeat(success, devices_found=None, duration_ms=None, error=None):

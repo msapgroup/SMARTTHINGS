@@ -2,18 +2,20 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.6
+## Current release: 0.7
 
 - Automatic ARP LAN discovery with `arp-scan`
 - Persistent SQLite inventory
 - New-device, disconnect, reconnect and IP-change events, tagged with severity
 - Three-state device lifecycle (online / suspected offline / offline) that tolerates a missed scan or two before flagging a device gone
 - Device classification (new / known / ignored / investigate) instead of a blunt trusted flag
+- Outbound alerting: generic webhook (PSA/ticketing, Power Automate, Slack, Teams, etc.), ntfy, and email, with per-scan storm protection
 - Session-based authentication with admin and read-only roles; forced password change on first login
 - Two-factor authentication (TOTP - Google Authenticator, Authy, 1Password, etc.) with one-time backup codes
 - Account lockout after repeated failed logins, idle session timeout, CSRF protection, security headers
 - Optional password rotation (30/90/180 days) and password history/reuse prevention
 - Admin-viewable audit log of logins, password changes, and administrative actions
+- TLS by default (Caddy reverse proxy, auto-configured by `install.sh`) and a randomly generated admin password at install time — no fixed default credentials shipped
 - Device names, type and notes
 - Search, status and classification filtering
 - Activity history
@@ -70,23 +72,30 @@ Then open `http://<raspberry-pi-ip>:8080` from a device on your LAN.
 
 ## Authentication
 
-On first boot with an empty database, GODSEYE creates a default admin
-account:
+`install.sh` generates a random admin password at install time and
+prints it once — there's no fixed, well-known default shipped in the
+code at all as of 0.6. The generated credentials are saved to
+`/etc/godseye.env` (root-only, `chmod 600`) in case you need them again,
+and are also enforced server-side to require a password change on first
+login regardless, as defense in depth.
 
-- Username: `GodsEye`
-- Password: `GodsEye`
+- Username: `GodsEye` (override with `GODSEYE_ADMIN_USER`)
+- Password: randomly generated, printed once at install — or set
+  `GODSEYE_ADMIN_PASSWORD` yourself before running `install.sh` (e.g. as
+  a hard step in a client-provisioning template) to skip the random one
 
-**You will be forced to set a new password the first time you log in** —
-this is enforced by the server, not just hidden behind the UI. To avoid
-the well-known default entirely, set `GODSEYE_ADMIN_USER` and
-`GODSEYE_ADMIN_PASSWORD` in `godseye-web.service` *before* the first boot
-(the seed only runs once, when the `users` table is empty).
+If you're running the app directly in development rather than through
+`install.sh` (`python3 -m app` with no env file), the same env vars still
+work the same way, but nothing generates a random password for you in
+that path — set `GODSEYE_ADMIN_PASSWORD` yourself, or expect the fallback
+default of `GodsEye`/`GodsEye`, which — same as ever — forces a change on
+first login.
 
 Once logged in as an admin, add additional accounts from the **Users**
 panel on the dashboard, or via the API:
 
 ```bash
-curl -X POST http://<pi-ip>:8080/api/v1/users \
+curl -X POST https://<pi-ip>:8443/api/v1/users \
   -H "Content-Type: application/json" \
   -H "X-CSRF-Token: <value of the godseye_csrf cookie>" \
   --cookie "godseye_session=<your session cookie>" \
@@ -135,8 +144,54 @@ Set these as `Environment=` lines in the systemd unit files (or export them befo
 | `GODSEYE_MIN_PASSWORD_LENGTH` | `12` | web | Minimum password length (NIST 800-63B requires ≥8; longer is encouraged over composition rules) |
 | `GODSEYE_PASSWORD_MAX_AGE_DAYS` | `0` (disabled) | web | Force a password change after N days — see the note below before enabling |
 | `GODSEYE_PASSWORD_HISTORY_COUNT` | `5` | web | How many previous passwords are remembered and blocked from reuse |
-| `GODSEYE_COOKIE_SECURE` | `false` | web | Set `true` if GODSEYE sits behind a TLS-terminating reverse proxy, to mark cookies `Secure` |
+| `GODSEYE_COOKIE_SECURE` | `false` (`true` when installed via `install.sh`) | web | Marks cookies `Secure` — needed when GODSEYE sits behind TLS |
 | `GODSEYE_LOGIN_BANNER` | *(empty)* | web | Optional text shown above the login form (e.g. an organizational consent/warning banner) |
+| `GODSEYE_WEBHOOK_URL` | *(empty, disabled)* | scanner | Generic outbound webhook — POSTs a JSON event payload here |
+| `GODSEYE_WEBHOOK_MIN_SEVERITY` | `warning` | scanner | Minimum event severity (`info`/`warning`/`critical`) that triggers the webhook |
+| `GODSEYE_WEBHOOK_AUTH_HEADER` / `GODSEYE_WEBHOOK_AUTH_VALUE` | *(empty)* | scanner | Optional header/value pair sent with the webhook (e.g. `Authorization` / `Bearer ...`) |
+| `GODSEYE_NTFY_TOPIC` | *(empty, disabled)* | scanner | [ntfy](https://ntfy.sh) topic to push to |
+| `GODSEYE_NTFY_SERVER` | `https://ntfy.sh` | scanner | ntfy server — point at your own if self-hosting |
+| `GODSEYE_NTFY_MIN_SEVERITY` | `warning` | scanner | Minimum severity that triggers an ntfy push |
+| `GODSEYE_SMTP_HOST` / `PORT` / `USER` / `PASSWORD` / `FROM` / `TO` | *(empty, disabled)* | scanner | SMTP settings for email alerts |
+| `GODSEYE_EMAIL_MIN_SEVERITY` | `critical` | scanner | Minimum severity that triggers an email (defaults higher than the other channels — email is for the events that most need same-shift attention, not a running log) |
+| `GODSEYE_MAX_NOTIFICATIONS_PER_SCAN` | `10` | scanner | Caps outbound notifications per scan cycle, so a burst (e.g. scanner recovering after downtime) can't create a notification storm. Every event is still recorded and visible on the dashboard regardless of this cap — only the *push* is capped. |
+
+## Alerting
+
+GODSEYE doesn't hardcode a specific ticketing/PSA integration (e.g.
+ConnectWise Manage) — those typically need per-company OAuth credentials
+that don't belong in a generic config file, and hardcoding one vendor's
+API shape means it silently breaks whenever that vendor changes it.
+Instead, `GODSEYE_WEBHOOK_URL` can point at anything that accepts a POST
+of a JSON event. Three channels are available, and any combination can be
+enabled at once:
+
+- **Webhook** — the highest-leverage option if you're already running a
+  PSA/ticketing tool: point it at your PSA's own webhook endpoint if it
+  has one, or at middleware (Power Automate's "When a HTTP request is
+  received" trigger, Zapier, n8n, or a small serverless function) that
+  holds your PSA credentials and creates a ticket. That keeps GODSEYE
+  itself free of vendor-specific code.
+- **ntfy** — a lightweight push straight to a phone, no account needed.
+  Good as a secondary channel for after-hours/on-call staff who aren't
+  watching the PSA in real time, or as a stopgap before a PSA
+  integration is set up.
+- **Email** — cheap, but easy to lose in an inbox. Defaults to
+  `critical`-only for that reason; use it for events that genuinely need
+  attention, not a running log.
+
+Each event GODSEYE sends looks like this:
+
+```json
+{
+  "mac": "aa:bb:cc:dd:ee:ff",
+  "event_type": "new_device",
+  "ip": "192.168.1.42",
+  "created_at": "2026-08-17T02:10:00+00:00",
+  "details": "New device discovered",
+  "severity": "warning"
+}
+```
 
 ## Development
 
@@ -192,19 +247,45 @@ families and HIPAA Security Rule technical safeguards, §164.312):**
   scans, viewable in an admin-only dashboard panel
 - Automatic logoff — idle session timeout (configurable)
 - Integrity — CSRF protection on all state-changing requests
-- **Not addressed by the application, and not addressable by application
-  code alone:**
-  - *Encryption at rest.* SQLite has no built-in encryption. The
-    database file's confidentiality depends on the Pi's disk — use full-disk
-    encryption (e.g. LUKS) if this matters for your data.
-  - *Encryption in transit.* GODSEYE serves plain HTTP by design (LAN-only,
-    see the security note below). Put a TLS-terminating reverse proxy in
-    front of it if you need encryption in transit, and set
-    `GODSEYE_COOKIE_SECURE=true` when you do.
+- **Encryption in transit is now on by default** (as of 0.6): `install.sh`
+  installs Caddy as a reverse proxy in front of GODSEYE and terminates TLS
+  automatically, so there's no "remembered to configure it" failure mode.
+  Since GODSEYE has no public DNS name (see Remote Access below), the
+  certificate is self-signed via Caddy's internal CA rather than a
+  publicly-trusted one — browsers will warn on first visit until you run
+  `sudo caddy trust` on each client device. `GODSEYE_COOKIE_SECURE` is set
+  automatically alongside it.
+- **Encryption at rest is deliberately *not* something this install
+  script can safely automate**, and it's worth explaining why rather than
+  papering over it. Full-disk encryption (LUKS) needs a secret to unlock
+  the disk on every boot. For an unattended appliance that has to survive
+  a power cut and come back up on its own, there are only two honest
+  options, and they trade against each other:
+  - **A passphrase entered at every boot.** Real protection against
+    physical theft of the device, but it means GODSEYE will *not* come
+    back online after a power loss until someone is physically present
+    to type it in — a real problem for a monitoring appliance you want
+    to recover unattended.
+  - **A keyfile stored on the boot media to unlock automatically.**
+    Keeps unattended reboot working, but if that keyfile sits unencrypted
+    next to the encrypted volume, it doesn't meaningfully protect against
+    the primary physical-theft threat model — anyone with the device has
+    the key too. This is worth naming plainly rather than shipping a
+    script that quietly does this and implies real protection it doesn't
+    provide.
+  Which trade-off is right depends on your deployment (a device in a
+  locked server closet has a different threat model than one on an open
+  shelf), so this is a decision for your imaging/provisioning pipeline,
+  not something `install.sh` should make silently on your behalf.
+  [Raspberry Pi OS's own LUKS guidance](https://www.raspberrypi.com/documentation/computers/configuration.html)
+  and your specific hardware's boot process are the right starting point.
   - *Business Associate Agreements, breach notification procedures,
     workforce training, risk assessments, physical safeguards.* These are
     organizational and legal requirements, not something a codebase
-    provides.
+    provides. If you need a technical-safeguards summary for counsel to
+    work from when drafting a BAA, that's something I can put together as
+    a factual capabilities/gaps document — just ask; it isn't legal
+    advice and should still go through an actual lawyer before use.
 
 **Legal industry (e.g. ABA Model Rule 1.6 confidentiality, 1.1 competence
 re: technology):** there's no single technical standard analogous to
@@ -248,9 +329,18 @@ you want, it's a reasonable roadmap addition.
 
 Near-term, following the phased plan in `docs/roadmap.md`:
 
-- Alert/rule engine on top of the new event severity field
+- Alert *rule* engine (custom conditions like "N new devices in 5 minutes" or
+  "known device offline 30+ minutes") on top of the webhook/ntfy/email
+  channels shipped in 0.6 — today every warning+/critical event notifies;
+  configurable rules are the next step
+- Alert acknowledgement and deduplication beyond the per-scan storm cap
+- Multi-site aggregation — running GODSEYE at more than one location works
+  today (each instance is independently reachable over VPN), but there's no
+  single dashboard that rolls up multiple sites' devices/events into one
+  view yet
+- Telegram/Slack-specific notification presets (both already work today via
+  the generic webhook, since both accept a plain POST)
 - OUI/manufacturer lookup and better automatic device classification
-- ntfy / Telegram / email notification plugins
 - Device detail and historical timelines
 - Ping and service monitoring, internet/DNS health
 - Network topology map, router/AP integrations, Wake-on-LAN
