@@ -2,8 +2,9 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.10
+## Current release: 0.11
 
+- Left sidebar navigation (Pi-Alert style) — Overview, Activity, Security, Alert Rules, Users, and Audit Log as separate views instead of one long scrolling page; collapses to a horizontally-scrollable top bar on mobile
 - Automatic ARP LAN discovery with `arp-scan`, plus reverse-DNS hostname lookup and an ICMP ping cross-check to reduce false offline events
 - Alert rule engine — new-device burst detection and classification-aware offline-duration escalation, on top of the existing webhook/ntfy/email channels
 - Persistent SQLite inventory
@@ -33,12 +34,16 @@
   <em>Login</em>
 </p>
 <p>
-  <img src="docs/screenshots/mfa-setup.png" width="700" alt="Two-factor authentication setup"><br>
-  <em>Two-factor setup - scan or enter the key into Google Authenticator or any TOTP app</em>
+  <img src="docs/screenshots/dashboard-full.png" width="700" alt="Dashboard with left sidebar navigation"><br>
+  <em>Overview - left sidebar navigation (Pi-Alert style) with Devices, Activity, Security, Alert Rules, Users, and Audit Log as separate views</em>
 </p>
 <p>
-  <img src="docs/screenshots/dashboard-full.png" width="700" alt="Full dashboard"><br>
-  <em>Dashboard - devices, activity, security panel, users, and audit log</em>
+  <img src="docs/screenshots/rules.png" width="700" alt="Alert Rules view"><br>
+  <em>Alert Rules - configure new-device-burst and offline-duration rules</em>
+</p>
+<p>
+  <img src="docs/screenshots/mfa-setup.png" width="700" alt="Two-factor authentication setup"><br>
+  <em>Two-factor setup - scan or enter the key into Google Authenticator or any TOTP app</em>
 </p>
 
 These are real renders of the actual dashboard HTML/CSS/JavaScript shipped

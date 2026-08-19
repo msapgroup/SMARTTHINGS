@@ -342,7 +342,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.10.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.11.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1078,7 +1078,9 @@ DASHBOARD = r'''<!doctype html>
 <style>
 :root{color-scheme:dark;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}*{box-sizing:border-box}body{margin:0;background:#070b12;color:#e8eef7}header{position:sticky;top:0;z-index:5;background:rgba(7,11,18,.94);backdrop-filter:blur(14px);border-bottom:1px solid #1d2838;padding:16px 4%;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.brand{display:flex;gap:12px;align-items:center}.eye{width:38px;height:38px;border-radius:12px;background:#182338;display:grid;place-items:center;font-size:21px}.brand b{font-size:20px;letter-spacing:.08em}.muted{color:#7f8da3;font-size:12px}button,.filter{border:1px solid #2b3a52;background:#111a28;color:#dbe7f7;border-radius:9px;padding:9px 13px;cursor:pointer}button.primary{background:#2563eb;border-color:#2563eb}button.danger{background:#3a1522;border-color:#5c2436;color:#ff8194}button.link{background:none;border:none;color:#7f9fd8;padding:4px 6px}.headerRight{display:flex;gap:10px;align-items:center}.wrap{max-width:1500px;margin:auto;padding:28px 4%}.hero{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:22px}.hero h1{font-size:32px;margin:0 0 5px}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}.card{background:linear-gradient(145deg,#101927,#0d141f);border:1px solid #1d2a3d;border-radius:14px;padding:18px}.label{color:#8090a7;font-size:12px;text-transform:uppercase;letter-spacing:.1em}.num{font-size:32px;font-weight:750;margin-top:7px}.green{color:#50e3a4}.yellow{color:#f7c948}.red{color:#ff6b81}.toolbar{display:flex;gap:9px;margin:22px 0;flex-wrap:wrap}.toolbar input{flex:1;min-width:220px}.input{background:#0d141f;border:1px solid #2b3a52;border-radius:9px;padding:10px;color:#e8eef7}.panel{background:#0d141f;border:1px solid #1d2a3d;border-radius:14px;overflow:hidden;margin-top:18px}.panel h2{font-size:16px;margin:0;padding:16px 18px;border-bottom:1px solid #1d2a3d;display:flex;justify-content:space-between;align-items:center}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 14px;border-bottom:1px solid #182335;font-size:13px}th{color:#72819a;font-size:11px;text-transform:uppercase;letter-spacing:.08em}tr:hover{background:#111a27}.dot{font-size:10px}.online{color:#50e3a4}.offline{color:#68758a}.suspected_offline{color:#f7c948}.pill{border:1px solid #31415a;border-radius:999px;padding:3px 8px;font-size:11px;color:#9eb0c8;cursor:pointer;background:none}.known{color:#50e3a4;border-color:#245c49}.new{color:#f7c948;border-color:#6d5a24}.investigate{color:#ff8194;border-color:#6d2e3c}.ignored{color:#72819a}.admin{color:#f7c948;border-color:#6d5a24}.readonly{color:#7f9fd8;border-color:#28406d}.critical{color:#ff8194;border-color:#6d2e3c}.warning{color:#f7c948;border-color:#6d5a24}.info{color:#7f9fd8;border-color:#28406d}.name{font-weight:650}.empty{padding:35px;text-align:center;color:#72819a}.healthbar{font-size:12px;padding:8px 4%;border-bottom:1px solid #1d2838}.healthbar.ok{color:#50e3a4}.healthbar.bad{color:#ff8194}
 .overlay{position:fixed;inset:0;background:#070b12;display:grid;place-items:center;z-index:50;padding:20px}.authcard{width:100%;max-width:360px;background:#101927;border:1px solid #1d2a3d;border-radius:16px;padding:28px}.authcard h2{margin:0 0 6px}.authcard form{display:flex;flex-direction:column;gap:11px;margin-top:18px}.authcard .input{width:100%}.err{color:#ff8194;font-size:13px;min-height:18px}.formRow{display:flex;gap:9px}.userForm{display:flex;gap:8px;padding:14px 18px;flex-wrap:wrap;border-bottom:1px solid #182335}.userForm .input{flex:1;min-width:120px}
+.shell{display:flex;align-items:flex-start}.sidebar{width:230px;flex-shrink:0;background:#0a0f18;border-right:1px solid #1d2838;padding:18px 0;display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto}.sidebar .brand{padding:0 18px 16px;margin-bottom:8px;border-bottom:1px solid #1d2838}.navlist{display:flex;flex-direction:column}.navitem{display:flex;align-items:center;gap:10px;padding:11px 18px;color:#9eb0c8;background:none;border:none;border-left:3px solid transparent;text-align:left;cursor:pointer;font-size:14px;width:100%}.navitem:hover{background:#111a28;color:#e8eef7}.navitem.active{background:#111a28;color:#e8eef7;border-left-color:#2563eb}.sidebar-footer{margin-top:auto;padding:14px 18px 4px;border-top:1px solid #1d2838;display:flex;flex-direction:column;gap:8px}.content{flex:1;min-width:0}
 @media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}th:nth-child(5),td:nth-child(5),th:nth-child(6),td:nth-child(6){display:none}}@media(max-width:600px){.cards{grid-template-columns:1fr}.hero{align-items:start;flex-direction:column}th:nth-child(4),td:nth-child(4){display:none}.wrap{padding:20px 3%}}
+@media(max-width:820px){.shell{flex-direction:column}.sidebar{width:100%;height:auto;position:sticky;top:0;flex-direction:column;overflow:visible;border-right:none;border-bottom:1px solid #1d2838;padding:8px 0;z-index:6}.sidebar .brand{display:none}.navlist{flex-direction:row;overflow-x:auto;padding:0 4%}.navitem{width:auto;white-space:nowrap;border-left:none;border-bottom:3px solid transparent;padding:8px 12px}.navitem.active{border-left:none;border-bottom-color:#2563eb}.sidebar-footer{margin-top:8px;flex-direction:row;border-top:1px solid #1d2838;padding:8px 4% 0;gap:10px;align-items:center;flex-wrap:wrap}.sidebar-footer #whoami{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sidebar-footer #scanBtn{width:auto!important;margin-bottom:0!important}}
 </style></head>
 <body>
 <div id="authOverlay" class="overlay" style="display:none">
@@ -1120,16 +1122,43 @@ DASHBOARD = r'''<!doctype html>
 <div id="app" style="display:none">
 <div class="healthbar" id="healthbar"></div>
 <div class="healthbar" id="pwReminderBar" style="display:none;color:#f7c948;cursor:pointer" onclick="openChangePassword()"></div>
-<header><div class="brand"><div class="eye">◉</div><div><b>GODSEYE</b><div class="muted">LOCAL NETWORK INTELLIGENCE</div></div></div>
-<div class="headerRight"><span class="muted" id="whoami"></span><button id="scanBtn" class="primary" onclick="scan()">⟳ Scan Now</button><button class="link" onclick="openChangePassword()">Change password</button><button class="link" onclick="logout()">Log out</button></div>
-</header>
-<div class="wrap"><div class="hero"><div><h1>Network Overview</h1><div class="muted" id="updated">Loading telemetry…</div></div></div>
+<div class="shell">
+<nav class="sidebar">
+<div class="brand"><div class="eye">◉</div><div><b>GODSEYE</b><div class="muted">LOCAL NETWORK INTELLIGENCE</div></div></div>
+<div class="navlist">
+<button class="navitem active" data-view="overview" onclick="showView('overview')">📡 <span>Overview</span></button>
+<button class="navitem" data-view="activity" onclick="showView('activity')">🕓 <span>Activity</span></button>
+<button class="navitem" data-view="security" onclick="showView('security')">🔒 <span>Security</span></button>
+<button class="navitem" id="navRules" data-view="rules" onclick="showView('rules')">⚡ <span>Alert Rules</span></button>
+<button class="navitem" id="navUsers" data-view="users" onclick="showView('users')">👤 <span>Users</span></button>
+<button class="navitem" id="navAudit" data-view="audit" onclick="showView('audit')">📜 <span>Audit Log</span></button>
+</div>
+<div class="sidebar-footer">
+<button id="scanBtn" class="primary" onclick="scan()">⟳ Scan Now</button>
+<div class="muted" id="whoami"></div>
+<button class="link" onclick="openChangePassword()">Change password</button>
+<button class="link" onclick="logout()">Log out</button>
+</div>
+</nav>
+<main class="content"><div class="wrap">
+
+<div class="view" id="view-overview">
+<div class="hero"><div><h1>Network Overview</h1><div class="muted" id="updated">Loading telemetry…</div></div></div>
 <div class="cards"><div class="card"><div class="label">Known Devices</div><div class="num" id="total">—</div></div><div class="card"><div class="label">Online</div><div class="num green" id="online">—</div></div><div class="card"><div class="label">Needs Review</div><div class="num yellow" id="unknown">—</div></div><div class="card"><div class="label">Events</div><div class="num" id="eventsCount">—</div></div><div class="card"><div class="label">Last Scan</div><div class="num" id="lastScan" style="font-size:16px">—</div></div></div>
 <div class="toolbar"><input id="search" class="input" placeholder="Search name, IP, MAC, hostname or vendor…" oninput="loadDevices()"><select id="status" class="filter" onchange="loadDevices()"><option value="">All statuses</option><option value="online">Online</option><option value="suspected_offline">Suspected offline</option><option value="offline">Offline</option></select><select id="classification" class="filter" onchange="loadDevices()"><option value="">All classifications</option><option value="new">New</option><option value="known">Known</option><option value="investigate">Investigate</option><option value="ignored">Ignored</option></select></div>
 <section class="panel"><h2>Devices</h2><div style="overflow:auto"><table><thead><tr><th>Status</th><th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th><th>Classification</th></tr></thead><tbody id="devices"></tbody></table></div></section>
+</div>
+
+<div class="view" id="view-activity" style="display:none">
 <section class="panel"><h2>Recent Activity</h2><div style="overflow:auto"><table><thead><tr><th>Time</th><th>Event</th><th>Device</th><th>IP</th><th>Details</th></tr></thead><tbody id="events"></tbody></table></div></section>
+</div>
+
+<div class="view" id="view-security" style="display:none">
 <section class="panel"><h2>Two-Factor Authentication</h2><div id="mfaStatus" style="padding:16px 18px"></div></section>
-<section class="panel" id="rulesPanel" style="display:none"><h2>Alert Rules</h2>
+</div>
+
+<div class="view" id="view-rules" style="display:none">
+<section class="panel" id="rulesPanel"><h2>Alert Rules</h2>
 <form class="userForm" onsubmit="return createRule(event)" style="flex-wrap:wrap">
 <input class="input" id="ruleName" placeholder="Rule name" required style="flex:1;min-width:160px">
 <select class="filter" id="ruleType" onchange="updateRuleFields()"><option value="new_device_burst">New device burst</option><option value="offline_duration">Offline duration</option></select>
@@ -1140,14 +1169,24 @@ DASHBOARD = r'''<!doctype html>
 </form>
 <div style="overflow:auto"><table><thead><tr><th>Name</th><th>Type</th><th>Condition</th><th>Severity</th><th>Last triggered</th><th>Enabled</th><th></th></tr></thead><tbody id="rules"></tbody></table></div>
 </section>
-<section class="panel" id="usersPanel" style="display:none"><h2>Users</h2>
+</div>
+
+<div class="view" id="view-users" style="display:none">
+<section class="panel" id="usersPanel"><h2>Users</h2>
 <form class="userForm" onsubmit="return createUser(event)"><input class="input" id="newUsername" placeholder="Username" required><input class="input" id="newUserPassword" type="password" placeholder="Password (min __MIN_PASSWORD_LENGTH__ chars)" required minlength="__MIN_PASSWORD_LENGTH__"><select class="filter" id="newUserRole"><option value="readonly">Read-only</option><option value="admin">Admin</option></select><button class="primary" type="submit">Add user</button></form>
 <div style="overflow:auto"><table><thead><tr><th>Username</th><th>Role</th><th>Created</th><th>Last login</th><th>Password changed</th><th>Must change PW</th><th>MFA</th><th></th></tr></thead><tbody id="users"></tbody></table></div>
 </section>
-<section class="panel" id="auditPanel" style="display:none"><h2>Audit Log</h2>
+</div>
+
+<div class="view" id="view-audit" style="display:none">
+<section class="panel" id="auditPanel"><h2>Audit Log</h2>
 <div style="overflow:auto"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th><th>IP</th></tr></thead><tbody id="auditRows"></tbody></table></div>
 </section>
-</div></div>
+</div>
+
+</div></main>
+</div>
+</div>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const CLASS_CYCLE={new:'known',known:'ignored',ignored:'investigate',investigate:'new'};
@@ -1158,6 +1197,7 @@ function getCookie(name){const m=document.cookie.match('(?:^|; )'+name+'=([^;]*)
 async function json(url,opt={}){opt.headers=opt.headers||{};if(opt.method&&opt.method!=='GET'){opt.headers['X-CSRF-Token']=getCookie('godseye_csrf')||''}let r=await fetch(url,opt);if(r.status===401){showLogin();throw new Error('unauthenticated')}if(!r.ok){let t=await r.text();throw new Error(t)}return r.status===204?null:r.json()}
 function showLogin(){document.getElementById('app').style.display='none';document.getElementById('pwOverlay').style.display='none';document.getElementById('mfaLoginOverlay').style.display='none';document.getElementById('authOverlay').style.display='grid'}
 function showApp(){document.getElementById('authOverlay').style.display='none';document.getElementById('pwOverlay').style.display='none';document.getElementById('mfaLoginOverlay').style.display='none';document.getElementById('app').style.display='block'}
+function showView(name){document.querySelectorAll('.view').forEach(v=>v.style.display='none');const target=document.getElementById('view-'+name);if(target)target.style.display='';document.querySelectorAll('.navitem').forEach(b=>b.classList.remove('active'));const btn=document.querySelector('.navitem[data-view="'+name+'"]');if(btn)btn.classList.add('active');if(name==='users'&&ME&&ME.role==='admin')loadUsers();if(name==='audit'&&ME&&ME.role==='admin')loadAudit();if(name==='rules')loadRules();if(name==='security')loadSecurity()}
 async function doLogin(e){e.preventDefault();const err=document.getElementById('loginErr');err.textContent='';try{let r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:loginUser.value,password:loginPass.value})});if(r.status===423){err.textContent='Account temporarily locked due to repeated failed logins. Try again later.';return false}if(!r.ok){err.textContent='Invalid username or password';return false}let data=await r.json();if(data.mfa_required){PENDING_MFA_TOKEN=data.pending_token;document.getElementById('authOverlay').style.display='none';document.getElementById('mfaLoginOverlay').style.display='grid';return false}if(data.must_change_password){document.getElementById('authOverlay').style.display='none';document.getElementById('pwOverlay').style.display='grid';return false}await boot()}catch(e){err.textContent='Sign-in failed'}return false}
 async function doMfaVerify(e){e.preventDefault();const err=document.getElementById('mfaLoginErr');err.textContent='';try{let r=await fetch('/api/v1/auth/mfa/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pending_token:PENDING_MFA_TOKEN,code:mfaCode.value.trim()})});if(!r.ok){err.textContent='Invalid code';return false}let data=await r.json();PENDING_MFA_TOKEN=null;if(data.must_change_password){document.getElementById('mfaLoginOverlay').style.display='none';document.getElementById('pwOverlay').style.display='grid';return false}await boot()}catch(e){err.textContent='Verification failed'}return false}
 function openChangePassword(){document.getElementById('pwOverlay').style.display='grid'}
@@ -1182,6 +1222,6 @@ async function removeUser(id,username){if(!confirm('Remove user "'+username+'"?'
 async function load(){let h=await json('/api/v1/health');total.textContent=h.total;online.textContent=h.online;unknown.textContent=h.needs_review;eventsCount.textContent=h.events;updated.textContent='Last refreshed '+new Date().toLocaleTimeString();lastScan.textContent=h.scanner.detail;const hb=document.getElementById('healthbar');if(!h.scanner.healthy){hb.className='healthbar bad';hb.textContent='⚠ Scanner unhealthy — '+h.scanner.detail;hb.style.display='block'}else{hb.style.display='none'}await loadDevices();let e=await json('/api/v1/events?limit=30');events.innerHTML=e.length?e.map(x=>`<tr><td>${esc(new Date(x.created_at).toLocaleString())}</td><td><span class="pill">${esc(x.event_type)}</span></td><td>${esc(x.mac)}</td><td>${esc(x.ip)}</td><td>${esc(x.details)}</td></tr>`).join(''):'<tr><td colspan="5" class="empty">No activity yet.</td></tr>'}
 async function cycleClass(id,current){await json('/api/v1/devices/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({classification:CLASS_CYCLE[current]||'new'})});load()}
 async function scan(){await json('/api/v1/scan',{method:'POST'});updated.textContent='Scan requested…';setTimeout(load,3000)}
-async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();setInterval(load,10000)}
+async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';['navRules','navUsers','navAudit'].forEach(id=>{document.getElementById(id).style.display=ME.role==='admin'?'':'none'});const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();setInterval(load,10000)}
 boot();
 </script></body></html>'''
