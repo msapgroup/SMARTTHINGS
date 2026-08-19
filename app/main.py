@@ -1,5 +1,7 @@
 import datetime as dt
 import hmac
+import json
+import math
 import os
 import secrets
 import sqlite3
@@ -23,6 +25,8 @@ HEARTBEAT_STALE_AFTER = int(os.environ.get("GODSEYE_HEARTBEAT_STALE_AFTER", "180
 
 VALID_CLASSIFICATIONS = {"new", "known", "ignored", "investigate"}
 VALID_ROLES = {"admin", "readonly"}
+VALID_RULE_TYPES = {"new_device_burst", "offline_duration"}
+VALID_SEVERITIES = {"info", "warning", "critical"}
 
 SESSION_COOKIE = "godseye_session"
 CSRF_COOKIE = "godseye_csrf"
@@ -51,6 +55,14 @@ WEAK_PASSWORDS = {
 # it regardless (common in older compliance baselines still used in some
 # legal and healthcare contexts).
 PASSWORD_MAX_AGE_DAYS = int(os.environ.get("GODSEYE_PASSWORD_MAX_AGE_DAYS", "0"))
+
+# When an admin sets someone's password for them (initial seed, a new user
+# created by an admin, or an admin-issued reset), the account isn't locked
+# out of everything until they change it - they get a grace period during
+# which the app works normally with just a reminder banner, and the change
+# is only truly enforced once the deadline passes. 0 means enforce
+# immediately with no grace period (the old, stricter behavior).
+PASSWORD_CHANGE_GRACE_DAYS = int(os.environ.get("GODSEYE_PASSWORD_CHANGE_GRACE_DAYS", "2"))
 PASSWORD_HISTORY_COUNT = int(os.environ.get("GODSEYE_PASSWORD_HISTORY_COUNT", "5"))
 
 MFA_PENDING_TTL_SECONDS = int(os.environ.get("GODSEYE_MFA_PENDING_TTL", "300"))  # 5 min to enter a code after password
@@ -100,6 +112,33 @@ def is_password_expired(password_changed_at: str | None) -> bool:
         return False
     age_days = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(password_changed_at)).total_seconds() / 86400
     return age_days >= PASSWORD_MAX_AGE_DAYS
+
+
+def must_change_deadline() -> str | None:
+    """Returns the ISO timestamp an admin-set password must be changed by,
+    or None if grace periods are disabled (enforce immediately)."""
+    if PASSWORD_CHANGE_GRACE_DAYS <= 0:
+        return None
+    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=PASSWORD_CHANGE_GRACE_DAYS)).isoformat()
+
+
+def must_change_now(must_change_flag, must_change_by: str | None) -> bool:
+    """Whether an admin-set password change is actually enforced yet.
+    A flag with no deadline (grace disabled, or a legacy row from before
+    grace periods existed) enforces immediately. A flag with a future
+    deadline doesn't block access until that deadline passes."""
+    if not must_change_flag:
+        return False
+    if not must_change_by:
+        return True
+    return dt.datetime.now(dt.timezone.utc) >= dt.datetime.fromisoformat(must_change_by)
+
+
+def days_until(deadline: str | None) -> int | None:
+    if not deadline:
+        return None
+    remaining = dt.datetime.fromisoformat(deadline) - dt.datetime.now(dt.timezone.utc)
+    return max(0, math.ceil(remaining.total_seconds() / 86400))
 
 
 def check_password_reuse(c, user_id: int, new_password: str, current_salt: str, current_hash: str):
@@ -166,7 +205,8 @@ def init_db():
             first_seen TEXT NOT NULL,
             last_seen TEXT NOT NULL,
             trusted INTEGER NOT NULL DEFAULT 0,
-            notes TEXT DEFAULT ''
+            notes TEXT DEFAULT '',
+            offline_escalated_at TEXT
         );
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY,
@@ -191,6 +231,7 @@ def init_db():
             password_salt TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'readonly',
             must_change_password INTEGER NOT NULL DEFAULT 0,
+            must_change_password_by TEXT,
             created_at TEXT NOT NULL,
             last_login_at TEXT,
             failed_attempts INTEGER NOT NULL DEFAULT 0,
@@ -240,6 +281,16 @@ def init_db():
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS rules (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            rule_type TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            params TEXT NOT NULL DEFAULT '{}',
+            severity TEXT NOT NULL DEFAULT 'critical',
+            created_at TEXT NOT NULL,
+            last_triggered_at TEXT
+        );
         CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
@@ -250,6 +301,8 @@ def init_db():
         _add_column_if_missing(c, "users", "failed_attempts", "failed_attempts INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(c, "users", "locked_until", "locked_until TEXT")
         _add_column_if_missing(c, "users", "password_changed_at", "password_changed_at TEXT")
+        _add_column_if_missing(c, "users", "must_change_password_by", "must_change_password_by TEXT")
+        _add_column_if_missing(c, "devices", "offline_escalated_at", "offline_escalated_at TEXT")
         _add_column_if_missing(c, "sessions", "last_seen_at", "last_seen_at TEXT")
         # Backfill so enabling GODSEYE_PASSWORD_MAX_AGE_DAYS after upgrading doesn't
         # instantly treat every existing account as already expired.
@@ -261,16 +314,26 @@ def init_db():
 
         if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             salt, hashed = hash_password(ADMIN_DEFAULT_PASSWORD)
+            deadline = must_change_deadline()
             c.execute(
-                "INSERT INTO users(username,password_hash,password_salt,role,must_change_password,created_at,password_changed_at) "
-                "VALUES(?,?,?,'admin',1,?,?)",
-                (ADMIN_DEFAULT_USER, hashed, salt, now(), now()),
+                "INSERT INTO users(username,password_hash,password_salt,role,must_change_password,"
+                "must_change_password_by,created_at,password_changed_at) "
+                "VALUES(?,?,?,'admin',1,?,?,?)",
+                (ADMIN_DEFAULT_USER, hashed, salt, deadline, now(), now()),
             )
-            print(
-                f"[GODSEYE] No users found - created default admin account '{ADMIN_DEFAULT_USER}'. "
-                "You will be required to set a new password on first login. Set GODSEYE_ADMIN_USER / "
-                "GODSEYE_ADMIN_PASSWORD before first boot to change the seeded credentials."
-            )
+            if deadline:
+                print(
+                    f"[GODSEYE] No users found - created default admin account '{ADMIN_DEFAULT_USER}'. "
+                    f"You have {PASSWORD_CHANGE_GRACE_DAYS} day(s) to set a new password before it's "
+                    "required. Set GODSEYE_ADMIN_USER / GODSEYE_ADMIN_PASSWORD before first boot to "
+                    "change the seeded credentials."
+                )
+            else:
+                print(
+                    f"[GODSEYE] No users found - created default admin account '{ADMIN_DEFAULT_USER}'. "
+                    "You will be required to set a new password on first login. Set GODSEYE_ADMIN_USER / "
+                    "GODSEYE_ADMIN_PASSWORD before first boot to change the seeded credentials."
+                )
 
 
 @asynccontextmanager
@@ -279,7 +342,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.10.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -385,8 +448,8 @@ def get_current_user(request: Request):
         raise HTTPException(401, "Not authenticated")
     with db() as c:
         row = c.execute(
-            "SELECT u.id AS id, u.username, u.role, u.must_change_password, u.password_changed_at, "
-            "s.expires_at, s.last_seen_at "
+            "SELECT u.id AS id, u.username, u.role, u.must_change_password, u.must_change_password_by, "
+            "u.password_changed_at, s.expires_at, s.last_seen_at "
             "FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=?",
             (token,),
         ).fetchone()
@@ -400,7 +463,8 @@ def get_current_user(request: Request):
             c.execute("DELETE FROM sessions WHERE token=?", (token,))
             raise HTTPException(401, "Session timed out due to inactivity")
         c.execute("UPDATE sessions SET last_seen_at=? WHERE token=?", (now(), token))
-    password_reset_needed = bool(row["must_change_password"]) or is_password_expired(row["password_changed_at"])
+    password_reset_needed = must_change_now(row["must_change_password"], row["must_change_password_by"]) \
+        or is_password_expired(row["password_changed_at"])
     if password_reset_needed and request.url.path not in ALLOWED_WHILE_PASSWORD_RESET_REQUIRED:
         # Enforced here, not just hidden behind the dashboard's modal, so a
         # direct API call can't skip the forced (or expired) password change either.
@@ -438,12 +502,19 @@ def _set_session_cookies(response: Response, token: str, csrf_token: str):
 
 
 def _login_response(user) -> dict:
-    return {
+    hard_blocked = must_change_now(user["must_change_password"], user["must_change_password_by"]) \
+        or is_password_expired(user["password_changed_at"])
+    resp = {
         "ok": True,
         "username": user["username"],
         "role": user["role"],
-        "must_change_password": bool(user["must_change_password"]) or is_password_expired(user["password_changed_at"]),
+        "must_change_password": hard_blocked,
     }
+    if user["must_change_password"] and not hard_blocked:
+        # Still in the grace period - not blocked, but the dashboard should
+        # show a reminder rather than stay silent about it.
+        resp["password_change_reminder_days"] = days_until(user["must_change_password_by"])
+    return resp
 
 
 @app.post(f"{router_prefix}/auth/login")
@@ -563,12 +634,16 @@ def logout(request: Request, response: Response):
 def me(user=Depends(get_current_user)):
     with db() as c:
         mfa = c.execute("SELECT enabled FROM mfa_secrets WHERE user_id=?", (user["id"],)).fetchone()
+    hard_blocked = must_change_now(user["must_change_password"], user["must_change_password_by"]) \
+        or is_password_expired(user["password_changed_at"])
     resp = {
         "username": user["username"],
         "role": user["role"],
-        "must_change_password": bool(user["must_change_password"]) or is_password_expired(user["password_changed_at"]),
+        "must_change_password": hard_blocked,
         "mfa_enabled": bool(mfa and mfa["enabled"]),
     }
+    if user["must_change_password"] and not hard_blocked:
+        resp["password_change_reminder_days"] = days_until(user["must_change_password_by"])
     if PASSWORD_MAX_AGE_DAYS > 0 and user["password_changed_at"]:
         age_days = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(user["password_changed_at"])).total_seconds() / 86400
         resp["password_expires_in_days"] = max(0, round(PASSWORD_MAX_AGE_DAYS - age_days))
@@ -586,7 +661,8 @@ def change_password(payload: ChangePasswordRequest, request: Request, user=Depen
         record_password_history(c, user["id"], row["password_salt"], row["password_hash"])
         salt, hashed = hash_password(payload.new_password)
         c.execute(
-            "UPDATE users SET password_hash=?,password_salt=?,must_change_password=0,password_changed_at=? WHERE id=?",
+            "UPDATE users SET password_hash=?,password_salt=?,must_change_password=0,"
+            "must_change_password_by=NULL,password_changed_at=? WHERE id=?",
             (hashed, salt, now(), user["id"]),
         )
         # Invalidate every session for this account, including the current one - if the
@@ -671,7 +747,8 @@ def mfa_disable(payload: MfaDisableRequest, request: Request, user=Depends(get_c
 def list_users(admin=Depends(require_admin)):
     with db() as c:
         rows = c.execute(
-            "SELECT u.id,u.username,u.role,u.must_change_password,u.created_at,u.last_login_at,u.password_changed_at, "
+            "SELECT u.id,u.username,u.role,u.must_change_password,u.must_change_password_by,"
+            "u.created_at,u.last_login_at,u.password_changed_at, "
             "COALESCE((SELECT enabled FROM mfa_secrets m WHERE m.user_id=u.id), 0) AS mfa_enabled "
             "FROM users u ORDER BY u.id"
         ).fetchall()
@@ -684,9 +761,10 @@ def create_user(payload: CreateUserRequest, request: Request, admin=Depends(requ
     with db() as c:
         try:
             c.execute(
-                "INSERT INTO users(username,password_hash,password_salt,role,must_change_password,created_at,password_changed_at) "
-                "VALUES(?,?,?,?,1,?,?)",
-                (payload.username, hashed, salt, payload.role, now(), now()),
+                "INSERT INTO users(username,password_hash,password_salt,role,must_change_password,"
+                "must_change_password_by,created_at,password_changed_at) "
+                "VALUES(?,?,?,?,1,?,?,?)",
+                (payload.username, hashed, salt, payload.role, must_change_deadline(), now(), now()),
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "Username already exists")
@@ -704,9 +782,9 @@ def admin_reset_password(user_id: int, payload: ResetPasswordRequest, request: R
         record_password_history(c, user_id, target["password_salt"], target["password_hash"])
         salt, hashed = hash_password(payload.new_password)
         c.execute(
-            "UPDATE users SET password_hash=?,password_salt=?,must_change_password=1,failed_attempts=0,"
-            "locked_until=NULL,password_changed_at=? WHERE id=?",
-            (hashed, salt, now(), user_id),
+            "UPDATE users SET password_hash=?,password_salt=?,must_change_password=1,"
+            "must_change_password_by=?,failed_attempts=0,locked_until=NULL,password_changed_at=? WHERE id=?",
+            (hashed, salt, must_change_deadline(), now(), user_id),
         )
         c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         audit(c, admin["username"], "password_reset_by_admin", target=target["username"] if target else str(user_id), ip=client_ip(request))
@@ -890,6 +968,101 @@ def manual_scan(request: Request, admin=Depends(require_admin)):
     return {"ok": True, "message": "Scan requested"}
 
 
+# ---------------------------------------------------------------------------
+# Alert rules (admin only to manage; the scanner service evaluates them)
+# ---------------------------------------------------------------------------
+
+class RuleCreate(BaseModel):
+    name: str
+    rule_type: str
+    params: dict
+    severity: str = "critical"
+    enabled: bool = True
+
+    @field_validator("rule_type")
+    @classmethod
+    def check_type(cls, v):
+        if v not in VALID_RULE_TYPES:
+            raise ValueError(f"rule_type must be one of {sorted(VALID_RULE_TYPES)}")
+        return v
+
+    @field_validator("severity")
+    @classmethod
+    def check_sev(cls, v):
+        if v not in VALID_SEVERITIES:
+            raise ValueError(f"severity must be one of {sorted(VALID_SEVERITIES)}")
+        return v
+
+    @field_validator("params")
+    @classmethod
+    def check_params(cls, v, info):
+        rule_type = info.data.get("rule_type")
+        if rule_type == "new_device_burst":
+            if "count" not in v or "window_minutes" not in v:
+                raise ValueError("new_device_burst params need 'count' and 'window_minutes'")
+            if not (isinstance(v["count"], (int, float)) and v["count"] > 0):
+                raise ValueError("'count' must be a positive number")
+            if not (isinstance(v["window_minutes"], (int, float)) and v["window_minutes"] > 0):
+                raise ValueError("'window_minutes' must be a positive number")
+        elif rule_type == "offline_duration":
+            if "minutes" not in v:
+                raise ValueError("offline_duration params need 'minutes'")
+            if not (isinstance(v["minutes"], (int, float)) and v["minutes"] > 0):
+                raise ValueError("'minutes' must be a positive number")
+            classes = v.get("classifications")
+            if classes is not None:
+                if not isinstance(classes, list) or not set(classes).issubset(VALID_CLASSIFICATIONS):
+                    raise ValueError(f"'classifications' must be a list drawn from {sorted(VALID_CLASSIFICATIONS)}")
+        return v
+
+
+class RuleUpdate(BaseModel):
+    enabled: bool | None = None
+
+
+@app.get(f"{router_prefix}/rules")
+def list_rules(user=Depends(get_current_user)):
+    with db() as c:
+        rows = c.execute("SELECT * FROM rules ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post(f"{router_prefix}/rules")
+def create_rule(payload: RuleCreate, request: Request, admin=Depends(require_admin)):
+    with db() as c:
+        c.execute(
+            "INSERT INTO rules(name,rule_type,enabled,params,severity,created_at) VALUES(?,?,?,?,?,?)",
+            (payload.name, payload.rule_type, int(payload.enabled), json.dumps(payload.params), payload.severity, now()),
+        )
+        audit(c, admin["username"], "rule_created", target=payload.name,
+              details=f"type={payload.rule_type}", ip=client_ip(request))
+    return {"ok": True}
+
+
+@app.patch(f"{router_prefix}/rules/{{rule_id}}")
+def update_rule(rule_id: int, payload: RuleUpdate, request: Request, admin=Depends(require_admin)):
+    if payload.enabled is None:
+        return {"ok": True}
+    with db() as c:
+        cur = c.execute("UPDATE rules SET enabled=? WHERE id=?", (int(payload.enabled), rule_id))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Rule not found")
+        audit(c, admin["username"], "rule_toggled", target=str(rule_id),
+              details=f"enabled={payload.enabled}", ip=client_ip(request))
+    return {"ok": True}
+
+
+@app.delete(f"{router_prefix}/rules/{{rule_id}}")
+def delete_rule(rule_id: int, request: Request, admin=Depends(require_admin)):
+    with db() as c:
+        rule = c.execute("SELECT name FROM rules WHERE id=?", (rule_id,)).fetchone()
+        if not rule:
+            raise HTTPException(404, "Rule not found")
+        c.execute("DELETE FROM rules WHERE id=?", (rule_id,))
+        audit(c, admin["username"], "rule_deleted", target=rule["name"], ip=client_ip(request))
+    return {"ok": True}
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     banner_html = LOGIN_BANNER.replace("<", "&lt;").replace(">", "&gt;") if LOGIN_BANNER else ""
@@ -903,7 +1076,7 @@ DASHBOARD = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GODSEYE — Network Monitor</title>
 <style>
-:root{color-scheme:dark;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}*{box-sizing:border-box}body{margin:0;background:#070b12;color:#e8eef7}header{position:sticky;top:0;z-index:5;background:rgba(7,11,18,.94);backdrop-filter:blur(14px);border-bottom:1px solid #1d2838;padding:16px 4%;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.brand{display:flex;gap:12px;align-items:center}.eye{width:38px;height:38px;border-radius:12px;background:#182338;display:grid;place-items:center;font-size:21px}.brand b{font-size:20px;letter-spacing:.08em}.muted{color:#7f8da3;font-size:12px}button,.filter{border:1px solid #2b3a52;background:#111a28;color:#dbe7f7;border-radius:9px;padding:9px 13px;cursor:pointer}button.primary{background:#2563eb;border-color:#2563eb}button.danger{background:#3a1522;border-color:#5c2436;color:#ff8194}button.link{background:none;border:none;color:#7f9fd8;padding:4px 6px}.headerRight{display:flex;gap:10px;align-items:center}.wrap{max-width:1500px;margin:auto;padding:28px 4%}.hero{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:22px}.hero h1{font-size:32px;margin:0 0 5px}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}.card{background:linear-gradient(145deg,#101927,#0d141f);border:1px solid #1d2a3d;border-radius:14px;padding:18px}.label{color:#8090a7;font-size:12px;text-transform:uppercase;letter-spacing:.1em}.num{font-size:32px;font-weight:750;margin-top:7px}.green{color:#50e3a4}.yellow{color:#f7c948}.red{color:#ff6b81}.toolbar{display:flex;gap:9px;margin:22px 0;flex-wrap:wrap}.toolbar input{flex:1;min-width:220px}.input{background:#0d141f;border:1px solid #2b3a52;border-radius:9px;padding:10px;color:#e8eef7}.panel{background:#0d141f;border:1px solid #1d2a3d;border-radius:14px;overflow:hidden;margin-top:18px}.panel h2{font-size:16px;margin:0;padding:16px 18px;border-bottom:1px solid #1d2a3d;display:flex;justify-content:space-between;align-items:center}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 14px;border-bottom:1px solid #182335;font-size:13px}th{color:#72819a;font-size:11px;text-transform:uppercase;letter-spacing:.08em}tr:hover{background:#111a27}.dot{font-size:10px}.online{color:#50e3a4}.offline{color:#68758a}.suspected_offline{color:#f7c948}.pill{border:1px solid #31415a;border-radius:999px;padding:3px 8px;font-size:11px;color:#9eb0c8;cursor:pointer;background:none}.known{color:#50e3a4;border-color:#245c49}.new{color:#f7c948;border-color:#6d5a24}.investigate{color:#ff8194;border-color:#6d2e3c}.ignored{color:#72819a}.admin{color:#f7c948;border-color:#6d5a24}.readonly{color:#7f9fd8;border-color:#28406d}.name{font-weight:650}.empty{padding:35px;text-align:center;color:#72819a}.healthbar{font-size:12px;padding:8px 4%;border-bottom:1px solid #1d2838}.healthbar.ok{color:#50e3a4}.healthbar.bad{color:#ff8194}
+:root{color-scheme:dark;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}*{box-sizing:border-box}body{margin:0;background:#070b12;color:#e8eef7}header{position:sticky;top:0;z-index:5;background:rgba(7,11,18,.94);backdrop-filter:blur(14px);border-bottom:1px solid #1d2838;padding:16px 4%;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.brand{display:flex;gap:12px;align-items:center}.eye{width:38px;height:38px;border-radius:12px;background:#182338;display:grid;place-items:center;font-size:21px}.brand b{font-size:20px;letter-spacing:.08em}.muted{color:#7f8da3;font-size:12px}button,.filter{border:1px solid #2b3a52;background:#111a28;color:#dbe7f7;border-radius:9px;padding:9px 13px;cursor:pointer}button.primary{background:#2563eb;border-color:#2563eb}button.danger{background:#3a1522;border-color:#5c2436;color:#ff8194}button.link{background:none;border:none;color:#7f9fd8;padding:4px 6px}.headerRight{display:flex;gap:10px;align-items:center}.wrap{max-width:1500px;margin:auto;padding:28px 4%}.hero{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:22px}.hero h1{font-size:32px;margin:0 0 5px}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}.card{background:linear-gradient(145deg,#101927,#0d141f);border:1px solid #1d2a3d;border-radius:14px;padding:18px}.label{color:#8090a7;font-size:12px;text-transform:uppercase;letter-spacing:.1em}.num{font-size:32px;font-weight:750;margin-top:7px}.green{color:#50e3a4}.yellow{color:#f7c948}.red{color:#ff6b81}.toolbar{display:flex;gap:9px;margin:22px 0;flex-wrap:wrap}.toolbar input{flex:1;min-width:220px}.input{background:#0d141f;border:1px solid #2b3a52;border-radius:9px;padding:10px;color:#e8eef7}.panel{background:#0d141f;border:1px solid #1d2a3d;border-radius:14px;overflow:hidden;margin-top:18px}.panel h2{font-size:16px;margin:0;padding:16px 18px;border-bottom:1px solid #1d2a3d;display:flex;justify-content:space-between;align-items:center}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 14px;border-bottom:1px solid #182335;font-size:13px}th{color:#72819a;font-size:11px;text-transform:uppercase;letter-spacing:.08em}tr:hover{background:#111a27}.dot{font-size:10px}.online{color:#50e3a4}.offline{color:#68758a}.suspected_offline{color:#f7c948}.pill{border:1px solid #31415a;border-radius:999px;padding:3px 8px;font-size:11px;color:#9eb0c8;cursor:pointer;background:none}.known{color:#50e3a4;border-color:#245c49}.new{color:#f7c948;border-color:#6d5a24}.investigate{color:#ff8194;border-color:#6d2e3c}.ignored{color:#72819a}.admin{color:#f7c948;border-color:#6d5a24}.readonly{color:#7f9fd8;border-color:#28406d}.critical{color:#ff8194;border-color:#6d2e3c}.warning{color:#f7c948;border-color:#6d5a24}.info{color:#7f9fd8;border-color:#28406d}.name{font-weight:650}.empty{padding:35px;text-align:center;color:#72819a}.healthbar{font-size:12px;padding:8px 4%;border-bottom:1px solid #1d2838}.healthbar.ok{color:#50e3a4}.healthbar.bad{color:#ff8194}
 .overlay{position:fixed;inset:0;background:#070b12;display:grid;place-items:center;z-index:50;padding:20px}.authcard{width:100%;max-width:360px;background:#101927;border:1px solid #1d2a3d;border-radius:16px;padding:28px}.authcard h2{margin:0 0 6px}.authcard form{display:flex;flex-direction:column;gap:11px;margin-top:18px}.authcard .input{width:100%}.err{color:#ff8194;font-size:13px;min-height:18px}.formRow{display:flex;gap:9px}.userForm{display:flex;gap:8px;padding:14px 18px;flex-wrap:wrap;border-bottom:1px solid #182335}.userForm .input{flex:1;min-width:120px}
 @media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}th:nth-child(5),td:nth-child(5),th:nth-child(6),td:nth-child(6){display:none}}@media(max-width:600px){.cards{grid-template-columns:1fr}.hero{align-items:start;flex-direction:column}th:nth-child(4),td:nth-child(4){display:none}.wrap{padding:20px 3%}}
 </style></head>
@@ -946,6 +1119,7 @@ DASHBOARD = r'''<!doctype html>
 </div>
 <div id="app" style="display:none">
 <div class="healthbar" id="healthbar"></div>
+<div class="healthbar" id="pwReminderBar" style="display:none;color:#f7c948;cursor:pointer" onclick="openChangePassword()"></div>
 <header><div class="brand"><div class="eye">◉</div><div><b>GODSEYE</b><div class="muted">LOCAL NETWORK INTELLIGENCE</div></div></div>
 <div class="headerRight"><span class="muted" id="whoami"></span><button id="scanBtn" class="primary" onclick="scan()">⟳ Scan Now</button><button class="link" onclick="openChangePassword()">Change password</button><button class="link" onclick="logout()">Log out</button></div>
 </header>
@@ -955,6 +1129,17 @@ DASHBOARD = r'''<!doctype html>
 <section class="panel"><h2>Devices</h2><div style="overflow:auto"><table><thead><tr><th>Status</th><th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th><th>Classification</th></tr></thead><tbody id="devices"></tbody></table></div></section>
 <section class="panel"><h2>Recent Activity</h2><div style="overflow:auto"><table><thead><tr><th>Time</th><th>Event</th><th>Device</th><th>IP</th><th>Details</th></tr></thead><tbody id="events"></tbody></table></div></section>
 <section class="panel"><h2>Two-Factor Authentication</h2><div id="mfaStatus" style="padding:16px 18px"></div></section>
+<section class="panel" id="rulesPanel" style="display:none"><h2>Alert Rules</h2>
+<form class="userForm" onsubmit="return createRule(event)" style="flex-wrap:wrap">
+<input class="input" id="ruleName" placeholder="Rule name" required style="flex:1;min-width:160px">
+<select class="filter" id="ruleType" onchange="updateRuleFields()"><option value="new_device_burst">New device burst</option><option value="offline_duration">Offline duration</option></select>
+<span id="ruleFieldsBurst" style="display:flex;gap:6px;align-items:center"><input class="input" id="ruleBurstCount" type="number" min="1" value="10" style="width:80px" title="Count"><span class="muted">new devices in</span><input class="input" id="ruleBurstWindow" type="number" min="1" value="5" style="width:80px" title="Window (minutes)"><span class="muted">min</span></span>
+<span id="ruleFieldsOffline" style="display:none;gap:6px;align-items:center"><span class="muted">offline</span><input class="input" id="ruleOfflineMinutes" type="number" min="1" value="30" style="width:80px" title="Minutes"><span class="muted">min, classes:</span><input class="input" id="ruleOfflineClasses" placeholder="known,investigate (blank=any)" style="width:190px"></span>
+<select class="filter" id="ruleSeverity"><option value="critical">Critical</option><option value="warning">Warning</option><option value="info">Info</option></select>
+<button class="primary" type="submit">Add rule</button>
+</form>
+<div style="overflow:auto"><table><thead><tr><th>Name</th><th>Type</th><th>Condition</th><th>Severity</th><th>Last triggered</th><th>Enabled</th><th></th></tr></thead><tbody id="rules"></tbody></table></div>
+</section>
 <section class="panel" id="usersPanel" style="display:none"><h2>Users</h2>
 <form class="userForm" onsubmit="return createUser(event)"><input class="input" id="newUsername" placeholder="Username" required><input class="input" id="newUserPassword" type="password" placeholder="Password (min __MIN_PASSWORD_LENGTH__ chars)" required minlength="__MIN_PASSWORD_LENGTH__"><select class="filter" id="newUserRole"><option value="readonly">Read-only</option><option value="admin">Admin</option></select><button class="primary" type="submit">Add user</button></form>
 <div style="overflow:auto"><table><thead><tr><th>Username</th><th>Role</th><th>Created</th><th>Last login</th><th>Password changed</th><th>Must change PW</th><th>MFA</th><th></th></tr></thead><tbody id="users"></tbody></table></div>
@@ -979,9 +1164,14 @@ function openChangePassword(){document.getElementById('pwOverlay').style.display
 async function doChangePassword(e){e.preventDefault();const err=document.getElementById('pwErr');err.textContent='';try{await json('/api/v1/auth/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:curPass.value,new_password:newPass.value})});await boot()}catch(e){err.textContent='Could not change password — check your current password'}return false}
 async function logout(){await fetch('/api/v1/auth/logout',{method:'POST',headers:{'X-CSRF-Token':getCookie('godseye_csrf')||''}});showLogin()}
 async function loadDevices(){let q=new URLSearchParams();if(search.value)q.set('search',search.value);if(status.value)q.set('status',status.value);if(classification.value)q.set('classification',classification.value);let d=await json('/api/v1/devices?'+q);const canEdit=ME&&ME.role==='admin';devices.innerHTML=d.length?d.map(x=>`<tr><td class="${esc(x.status)}"><span class="dot">●</span> ${esc(x.status).replace('_',' ')}</td><td><div class="name">${esc(x.name||x.hostname||'Unknown device')}</div><div class="muted">${esc(x.device_type||'Unclassified')}</div></td><td>${esc(x.ip)}</td><td>${esc(x.mac)}</td><td>${esc(x.vendor||'—')}</td><td><button class="pill ${esc(x.classification)}" ${canEdit?`onclick="cycleClass(${x.id},'${x.classification}')"`:'disabled'}>${CLASS_LABEL[x.classification]||x.classification}</button></td></tr>`).join(''):'<tr><td colspan="6" class="empty">No devices match this filter.</td></tr>'}
-async function loadUsers(){if(!ME||ME.role!=='admin'){usersPanel.style.display='none';return}usersPanel.style.display='block';let u=await json('/api/v1/users');users.innerHTML=u.map(x=>`<tr><td>${esc(x.username)}</td><td><span class="pill ${esc(x.role)}">${esc(x.role)}</span></td><td>${esc(new Date(x.created_at).toLocaleDateString())}</td><td>${x.last_login_at?esc(new Date(x.last_login_at).toLocaleString()):'never'}</td><td>${x.password_changed_at?esc(new Date(x.password_changed_at).toLocaleDateString()):'—'}</td><td>${x.must_change_password?'yes':'no'}</td><td>${x.mfa_enabled?'yes':'no'}</td><td>${x.username===ME.username?'':`<button class="link" onclick="removeUser(${x.id},'${esc(x.username)}')">Remove</button>${x.mfa_enabled?` <button class="link" onclick="resetUserMfa(${x.id},'${esc(x.username)}')">Reset MFA</button>`:''}`}</td></tr>`).join('')}
+async function loadUsers(){if(!ME||ME.role!=='admin'){usersPanel.style.display='none';return}usersPanel.style.display='block';let u=await json('/api/v1/users');users.innerHTML=u.map(x=>{let mustChange=x.must_change_password?(x.must_change_password_by?`yes, by ${esc(new Date(x.must_change_password_by).toLocaleDateString())}`:'yes'):'no';return `<tr><td>${esc(x.username)}</td><td><span class="pill ${esc(x.role)}">${esc(x.role)}</span></td><td>${esc(new Date(x.created_at).toLocaleDateString())}</td><td>${x.last_login_at?esc(new Date(x.last_login_at).toLocaleString()):'never'}</td><td>${x.password_changed_at?esc(new Date(x.password_changed_at).toLocaleDateString()):'—'}</td><td>${mustChange}</td><td>${x.mfa_enabled?'yes':'no'}</td><td>${x.username===ME.username?'':`<button class="link" onclick="removeUser(${x.id},'${esc(x.username)}')">Remove</button>${x.mfa_enabled?` <button class="link" onclick="resetUserMfa(${x.id},'${esc(x.username)}')">Reset MFA</button>`:''}`}</td></tr>`}).join('')}
 async function loadAudit(){if(!ME||ME.role!=='admin'){auditPanel.style.display='none';return}auditPanel.style.display='block';let a=await json('/api/v1/audit?limit=50');auditRows.innerHTML=a.length?a.map(x=>`<tr><td>${esc(new Date(x.created_at).toLocaleString())}</td><td>${esc(x.actor)}</td><td><span class="pill">${esc(x.action)}</span></td><td>${esc(x.target||'—')}</td><td>${esc(x.details||'')}</td><td>${esc(x.ip||'—')}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">No audit entries yet.</td></tr>'}
 async function loadSecurity(){const el=document.getElementById('mfaStatus');if(ME.mfa_enabled){el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#50e3a4">enabled</b> on this account.</div><button class="link" style="margin-top:10px" onclick="startMfaDisable()">Disable MFA</button>`}else{el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#f7c948">not enabled</b>. Add it for a second layer of protection beyond your password.</div><button class="primary" style="margin-top:10px" onclick="startMfaSetup()">Set up MFA</button>`}}
+function updateRuleFields(){const t=document.getElementById('ruleType').value;document.getElementById('ruleFieldsBurst').style.display=t==='new_device_burst'?'flex':'none';document.getElementById('ruleFieldsOffline').style.display=t==='offline_duration'?'flex':'none'}
+async function loadRules(){if(!ME||ME.role!=='admin'){rulesPanel.style.display='none';return}rulesPanel.style.display='block';let r=await json('/api/v1/rules');rules.innerHTML=r.length?r.map(x=>{let p;try{p=JSON.parse(x.params)}catch(e){p={}}let cond=x.rule_type==='new_device_burst'?`${p.count}+ new devices in ${p.window_minutes}m`:`offline ${p.minutes}m+ (${(p.classifications&&p.classifications.length?p.classifications:['any']).join(', ')})`;return `<tr><td>${esc(x.name)}</td><td>${esc(x.rule_type)}</td><td>${esc(cond)}</td><td><span class="pill ${esc(x.severity)}">${esc(x.severity)}</span></td><td>${x.last_triggered_at?esc(new Date(x.last_triggered_at).toLocaleString()):'never'}</td><td><input type="checkbox" ${x.enabled?'checked':''} onchange="toggleRule(${x.id},this.checked)"></td><td><button class="link" onclick="removeRule(${x.id},'${esc(x.name)}')">Remove</button></td></tr>`}).join(''):'<tr><td colspan="7" class="empty">No rules configured yet.</td></tr>'}
+async function createRule(e){e.preventDefault();const type=document.getElementById('ruleType').value;let params;if(type==='new_device_burst'){params={count:parseInt(ruleBurstCount.value,10),window_minutes:parseFloat(ruleBurstWindow.value)}}else{params={minutes:parseFloat(ruleOfflineMinutes.value)};const raw=ruleOfflineClasses.value.trim();if(raw)params.classifications=raw.split(',').map(s=>s.trim()).filter(Boolean)}try{await json('/api/v1/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:ruleName.value,rule_type:type,params:params,severity:ruleSeverity.value})});ruleName.value='';await loadRules()}catch(e){alert('Could not create rule: '+e.message)}return false}
+async function toggleRule(id,enabled){await json('/api/v1/rules/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})});await loadRules()}
+async function removeRule(id,name){if(!confirm('Remove rule "'+name+'"?'))return;await json('/api/v1/rules/'+id,{method:'DELETE'});await loadRules()}
 async function startMfaSetup(){let data=await json('/api/v1/auth/mfa/setup',{method:'POST'});const el=document.getElementById('mfaStatus');el.innerHTML=`<div class="muted">In Google Authenticator (or any TOTP app), choose "Enter a setup key" and type this in:</div><div style="font-family:monospace;font-size:16px;background:#0d141f;border:1px solid #2b3a52;border-radius:8px;padding:10px;margin:10px 0;word-break:break-all">${esc(data.secret)}</div><div class="muted" style="font-size:11px;word-break:break-all">${esc(data.otpauth_uri)}</div><form onsubmit="return confirmMfaSetup(event)" style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap"><input class="input" id="mfaConfirmCode" placeholder="Enter 6-digit code to confirm" required style="flex:1;min-width:180px"><button class="primary" type="submit">Confirm</button></form><div class="err" id="mfaSetupErr"></div>`}
 async function confirmMfaSetup(e){e.preventDefault();const err=document.getElementById('mfaSetupErr');err.textContent='';try{let data=await json('/api/v1/auth/mfa/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:mfaConfirmCode.value.trim()})});const el=document.getElementById('mfaStatus');el.innerHTML=`<div class="muted" style="color:#50e3a4">MFA enabled. Save these one-time backup codes somewhere safe — each works once if you lose access to your authenticator app:</div><div style="font-family:monospace;background:#0d141f;border:1px solid #2b3a52;border-radius:8px;padding:10px;margin:10px 0">${data.backup_codes.map(esc).join('<br>')}</div><button class="primary" onclick="boot()">Done</button>`;ME=await json('/api/v1/auth/me')}catch(e){err.textContent='Incorrect code — try again'}return false}
 async function startMfaDisable(){const el=document.getElementById('mfaStatus');el.innerHTML=`<form onsubmit="return confirmMfaDisable(event)" style="display:flex;flex-direction:column;gap:8px;max-width:320px"><input class="input" id="mfaDisablePw" type="password" placeholder="Current password" required><input class="input" id="mfaDisableCode" placeholder="6-digit code or backup code" required><button class="danger" type="submit">Disable MFA</button><div class="err" id="mfaDisableErr"></div></form>`}
@@ -992,6 +1182,6 @@ async function removeUser(id,username){if(!confirm('Remove user "'+username+'"?'
 async function load(){let h=await json('/api/v1/health');total.textContent=h.total;online.textContent=h.online;unknown.textContent=h.needs_review;eventsCount.textContent=h.events;updated.textContent='Last refreshed '+new Date().toLocaleTimeString();lastScan.textContent=h.scanner.detail;const hb=document.getElementById('healthbar');if(!h.scanner.healthy){hb.className='healthbar bad';hb.textContent='⚠ Scanner unhealthy — '+h.scanner.detail;hb.style.display='block'}else{hb.style.display='none'}await loadDevices();let e=await json('/api/v1/events?limit=30');events.innerHTML=e.length?e.map(x=>`<tr><td>${esc(new Date(x.created_at).toLocaleString())}</td><td><span class="pill">${esc(x.event_type)}</span></td><td>${esc(x.mac)}</td><td>${esc(x.ip)}</td><td>${esc(x.details)}</td></tr>`).join(''):'<tr><td colspan="5" class="empty">No activity yet.</td></tr>'}
 async function cycleClass(id,current){await json('/api/v1/devices/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({classification:CLASS_CYCLE[current]||'new'})});load()}
 async function scan(){await json('/api/v1/scan',{method:'POST'});updated.textContent='Scan requested…';setTimeout(load,3000)}
-async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';showApp();await load();await loadUsers();await loadAudit();await loadSecurity();setInterval(load,10000)}
+async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();setInterval(load,10000)}
 boot();
 </script></body></html>'''
