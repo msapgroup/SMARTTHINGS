@@ -2,8 +2,9 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.11
+## Current release: 0.12
 
+- EventLogExpert-inspired filtering on the Activity and Audit Log views — AND/OR conditions, include/exclude mode, color highlight rules, and a personal saved Filter Library per user
 - Left sidebar navigation (Pi-Alert style) — Overview, Activity, Security, Alert Rules, Users, and Audit Log as separate views instead of one long scrolling page; collapses to a horizontally-scrollable top bar on mobile
 - Automatic ARP LAN discovery with `arp-scan`, plus reverse-DNS hostname lookup and an ICMP ping cross-check to reduce false offline events
 - Alert rule engine — new-device burst detection and classification-aware offline-duration escalation, on top of the existing webhook/ntfy/email channels
@@ -40,6 +41,10 @@
 <p>
   <img src="docs/screenshots/rules.png" width="700" alt="Alert Rules view"><br>
   <em>Alert Rules - configure new-device-burst and offline-duration rules</em>
+</p>
+<p>
+  <img src="docs/screenshots/activity-filters.png" width="700" alt="Activity view with EventLogExpert-style filtering and highlight rules"><br>
+  <em>Activity - AND/OR condition filtering, include/exclude mode, and color highlight rules (EventLogExpert-inspired)</em>
 </p>
 <p>
   <img src="docs/screenshots/mfa-setup.png" width="700" alt="Two-factor authentication setup"><br>
@@ -233,6 +238,28 @@ that with conditions on *patterns* rather than single events:
 Both produce a `rule_triggered` event at the severity you configure,
 which flows through the same webhook/ntfy/email channels as any other
 event — no separate plumbing to configure.
+
+## Activity and Audit Log filtering
+
+The Activity and Audit Log views (as of 0.12) support EventLogExpert-style
+filtering, entirely client-side against the most recent batch of rows
+(up to 300 events / 300 audit entries — plenty for a home or small-business
+deployment; this isn't built for querying years of history):
+
+- **Conditions** — pick a field (event type, severity, MAC, IP, details,
+  or actor/action/target for audit), an operator (contains / does not
+  contain / equals / not equals), and a value. Multiple conditions can be
+  joined with **AND** (match all) or **OR** (match any).
+- **Include / Exclude mode** — show only matching rows, or hide them and
+  show everything else.
+- **Highlight rules** — separate from the include/exclude filter: color
+  matching rows without hiding anything else, so you can eyeball patterns
+  (e.g. tint every `critical` event red) while still seeing full context.
+- **Filter Library** — save a named filter (conditions + highlights) and
+  reapply it with one click later. Saved filters are personal to your
+  account — each user has their own library, stored server-side so it
+  follows you across devices rather than being stuck in one browser's
+  local storage.
 
 ## Discovery methods
 

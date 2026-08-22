@@ -88,7 +88,7 @@ def send_email(event: dict):
     msg.set_content(
         f"Event: {event['event_type']}\n"
         f"Severity: {event['severity']}\n"
-        f"Device MAC: {event.get('mac', '')}\n"
+        f"Device MAC: {event.get('mac') or ''}\n"
         f"IP: {event.get('ip', '')}\n"
         f"Time: {event.get('created_at', '')}\n"
         f"Details: {event.get('details', '')}\n"
