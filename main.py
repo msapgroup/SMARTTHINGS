@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, field_validator
 
 from .auth import generate_totp_secret, hash_password, new_token, totp_provisioning_uri, verify_password, verify_totp
@@ -22,6 +22,16 @@ DB_PATH = Path(os.environ.get("GODSEYE_DB", BASE_DIR / "data" / "godseye.db"))
 # otherwise GODSEYE can look fine on the dashboard while silently doing
 # nothing (see /api/v1/health).
 HEARTBEAT_STALE_AFTER = int(os.environ.get("GODSEYE_HEARTBEAT_STALE_AFTER", "180"))
+
+# Prometheus metrics endpoint is opt-in, not on-by-default: unlike the
+# dashboard, a metrics scraper can't do a cookie-based login, so this needs
+# its own auth story. Leaving GODSEYE_METRICS_TOKEN unset disables the
+# endpoint entirely (404) rather than exposing device inventory data on the
+# LAN without any credential - matches this project's default-secure posture
+# elsewhere (e.g. install.sh generating a real admin password instead of a
+# known default). Set it and configure the same value as a bearer_token in
+# your Prometheus scrape config to enable.
+METRICS_TOKEN = os.environ.get("GODSEYE_METRICS_TOKEN", "")
 
 VALID_CLASSIFICATIONS = {"new", "known", "ignored", "investigate"}
 VALID_ROLES = {"admin", "readonly"}
@@ -351,7 +361,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.12.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.13.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -896,6 +906,87 @@ def health(user=Depends(get_current_user)):
             "scan_duration_ms": hb["scan_duration_ms"] if hb else None,
         },
     }
+
+
+def _prom_escape(v: str) -> str:
+    return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def render_prometheus_metrics() -> str:
+    """Builds the metrics body. Pulled out as its own function (not inline
+    in the route) so it can be unit tested without needing a real HTTP
+    request/response cycle."""
+    with db() as c:
+        total = c.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        by_status = c.execute("SELECT status, COUNT(*) c FROM devices GROUP BY status").fetchall()
+        by_classification = c.execute("SELECT classification, COUNT(*) c FROM devices GROUP BY classification").fetchall()
+        events_total = c.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        events_by_severity = c.execute("SELECT severity, COUNT(*) c FROM events GROUP BY severity").fetchall()
+        users_total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        rules_enabled = c.execute("SELECT COUNT(*) FROM rules WHERE enabled=1").fetchone()[0]
+        hb = c.execute("SELECT * FROM scanner_heartbeat WHERE id=1").fetchone()
+
+    scanner_healthy = 0
+    last_success_ts = 0
+    if hb and hb["last_success_at"]:
+        age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(hb["last_success_at"])).total_seconds()
+        scanner_healthy = 1 if age <= HEARTBEAT_STALE_AFTER else 0
+        last_success_ts = int(dt.datetime.fromisoformat(hb["last_success_at"]).timestamp())
+
+    lines = []
+    lines += [
+        "# HELP godseye_devices_total Total number of known devices",
+        "# TYPE godseye_devices_total gauge",
+        f"godseye_devices_total {total}",
+        "# HELP godseye_devices_by_status Number of devices by network status",
+        "# TYPE godseye_devices_by_status gauge",
+    ]
+    for row in by_status:
+        lines.append(f'godseye_devices_by_status{{status="{_prom_escape(row["status"] or "unknown")}"}} {row["c"]}')
+    lines += [
+        "# HELP godseye_devices_by_classification Number of devices by classification",
+        "# TYPE godseye_devices_by_classification gauge",
+    ]
+    for row in by_classification:
+        lines.append(f'godseye_devices_by_classification{{classification="{_prom_escape(row["classification"] or "new")}"}} {row["c"]}')
+    lines += [
+        "# HELP godseye_events_total Total number of recorded events",
+        "# TYPE godseye_events_total counter",
+        f"godseye_events_total {events_total}",
+        "# HELP godseye_events_by_severity Total recorded events by severity",
+        "# TYPE godseye_events_by_severity counter",
+    ]
+    for row in events_by_severity:
+        lines.append(f'godseye_events_by_severity{{severity="{_prom_escape(row["severity"] or "info")}"}} {row["c"]}')
+    lines += [
+        "# HELP godseye_users_total Total number of user accounts",
+        "# TYPE godseye_users_total gauge",
+        f"godseye_users_total {users_total}",
+        "# HELP godseye_rules_enabled Number of enabled alert rules",
+        "# TYPE godseye_rules_enabled gauge",
+        f"godseye_rules_enabled {rules_enabled}",
+        "# HELP godseye_scanner_healthy Whether the scanner heartbeat is within the healthy threshold",
+        "# TYPE godseye_scanner_healthy gauge",
+        f"godseye_scanner_healthy {scanner_healthy}",
+        "# HELP godseye_scanner_last_success_timestamp_seconds Unix timestamp of the last successful scan",
+        "# TYPE godseye_scanner_last_success_timestamp_seconds gauge",
+        f"godseye_scanner_last_success_timestamp_seconds {last_success_ts}",
+        "# HELP godseye_scanner_last_scan_duration_ms Duration of the most recent scan cycle in milliseconds",
+        "# TYPE godseye_scanner_last_scan_duration_ms gauge",
+        f"godseye_scanner_last_scan_duration_ms {hb['scan_duration_ms'] if hb and hb['scan_duration_ms'] is not None else 0}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+@app.get("/metrics")
+def metrics(request: Request):
+    if not METRICS_TOKEN:
+        raise HTTPException(404, "Not found")
+    auth_header = request.headers.get("authorization", "")
+    provided = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
+    if not provided or not hmac.compare_digest(provided, METRICS_TOKEN):
+        raise HTTPException(401, "Invalid or missing bearer token")
+    return PlainTextResponse(render_prometheus_metrics(), media_type="text/plain; version=0.0.4")
 
 
 @app.get(f"{router_prefix}/devices")

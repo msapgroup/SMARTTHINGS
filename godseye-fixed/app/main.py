@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, field_validator
 
 from .auth import generate_totp_secret, hash_password, new_token, totp_provisioning_uri, verify_password, verify_totp
@@ -22,6 +22,16 @@ DB_PATH = Path(os.environ.get("GODSEYE_DB", BASE_DIR / "data" / "godseye.db"))
 # otherwise GODSEYE can look fine on the dashboard while silently doing
 # nothing (see /api/v1/health).
 HEARTBEAT_STALE_AFTER = int(os.environ.get("GODSEYE_HEARTBEAT_STALE_AFTER", "180"))
+
+# Prometheus metrics endpoint is opt-in, not on-by-default: unlike the
+# dashboard, a metrics scraper can't do a cookie-based login, so this needs
+# its own auth story. Leaving GODSEYE_METRICS_TOKEN unset disables the
+# endpoint entirely (404) rather than exposing device inventory data on the
+# LAN without any credential - matches this project's default-secure posture
+# elsewhere (e.g. install.sh generating a real admin password instead of a
+# known default). Set it and configure the same value as a bearer_token in
+# your Prometheus scrape config to enable.
+METRICS_TOKEN = os.environ.get("GODSEYE_METRICS_TOKEN", "")
 
 VALID_CLASSIFICATIONS = {"new", "known", "ignored", "investigate"}
 VALID_ROLES = {"admin", "readonly"}
@@ -291,12 +301,21 @@ def init_db():
             created_at TEXT NOT NULL,
             last_triggered_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS saved_filters (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            target TEXT NOT NULL,
+            name TEXT NOT NULL,
+            definition TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_pwhistory_user ON password_history(user_id);
         CREATE INDEX IF NOT EXISTS idx_backupcodes_user ON mfa_backup_codes(user_id);
+        CREATE INDEX IF NOT EXISTS idx_savedfilters_user ON saved_filters(user_id);
         """)
         _add_column_if_missing(c, "users", "failed_attempts", "failed_attempts INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(c, "users", "locked_until", "locked_until TEXT")
@@ -342,7 +361,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.11.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.13.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -889,6 +908,87 @@ def health(user=Depends(get_current_user)):
     }
 
 
+def _prom_escape(v: str) -> str:
+    return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def render_prometheus_metrics() -> str:
+    """Builds the metrics body. Pulled out as its own function (not inline
+    in the route) so it can be unit tested without needing a real HTTP
+    request/response cycle."""
+    with db() as c:
+        total = c.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        by_status = c.execute("SELECT status, COUNT(*) c FROM devices GROUP BY status").fetchall()
+        by_classification = c.execute("SELECT classification, COUNT(*) c FROM devices GROUP BY classification").fetchall()
+        events_total = c.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        events_by_severity = c.execute("SELECT severity, COUNT(*) c FROM events GROUP BY severity").fetchall()
+        users_total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        rules_enabled = c.execute("SELECT COUNT(*) FROM rules WHERE enabled=1").fetchone()[0]
+        hb = c.execute("SELECT * FROM scanner_heartbeat WHERE id=1").fetchone()
+
+    scanner_healthy = 0
+    last_success_ts = 0
+    if hb and hb["last_success_at"]:
+        age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(hb["last_success_at"])).total_seconds()
+        scanner_healthy = 1 if age <= HEARTBEAT_STALE_AFTER else 0
+        last_success_ts = int(dt.datetime.fromisoformat(hb["last_success_at"]).timestamp())
+
+    lines = []
+    lines += [
+        "# HELP godseye_devices_total Total number of known devices",
+        "# TYPE godseye_devices_total gauge",
+        f"godseye_devices_total {total}",
+        "# HELP godseye_devices_by_status Number of devices by network status",
+        "# TYPE godseye_devices_by_status gauge",
+    ]
+    for row in by_status:
+        lines.append(f'godseye_devices_by_status{{status="{_prom_escape(row["status"] or "unknown")}"}} {row["c"]}')
+    lines += [
+        "# HELP godseye_devices_by_classification Number of devices by classification",
+        "# TYPE godseye_devices_by_classification gauge",
+    ]
+    for row in by_classification:
+        lines.append(f'godseye_devices_by_classification{{classification="{_prom_escape(row["classification"] or "new")}"}} {row["c"]}')
+    lines += [
+        "# HELP godseye_events_total Total number of recorded events",
+        "# TYPE godseye_events_total counter",
+        f"godseye_events_total {events_total}",
+        "# HELP godseye_events_by_severity Total recorded events by severity",
+        "# TYPE godseye_events_by_severity counter",
+    ]
+    for row in events_by_severity:
+        lines.append(f'godseye_events_by_severity{{severity="{_prom_escape(row["severity"] or "info")}"}} {row["c"]}')
+    lines += [
+        "# HELP godseye_users_total Total number of user accounts",
+        "# TYPE godseye_users_total gauge",
+        f"godseye_users_total {users_total}",
+        "# HELP godseye_rules_enabled Number of enabled alert rules",
+        "# TYPE godseye_rules_enabled gauge",
+        f"godseye_rules_enabled {rules_enabled}",
+        "# HELP godseye_scanner_healthy Whether the scanner heartbeat is within the healthy threshold",
+        "# TYPE godseye_scanner_healthy gauge",
+        f"godseye_scanner_healthy {scanner_healthy}",
+        "# HELP godseye_scanner_last_success_timestamp_seconds Unix timestamp of the last successful scan",
+        "# TYPE godseye_scanner_last_success_timestamp_seconds gauge",
+        f"godseye_scanner_last_success_timestamp_seconds {last_success_ts}",
+        "# HELP godseye_scanner_last_scan_duration_ms Duration of the most recent scan cycle in milliseconds",
+        "# TYPE godseye_scanner_last_scan_duration_ms gauge",
+        f"godseye_scanner_last_scan_duration_ms {hb['scan_duration_ms'] if hb and hb['scan_duration_ms'] is not None else 0}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+@app.get("/metrics")
+def metrics(request: Request):
+    if not METRICS_TOKEN:
+        raise HTTPException(404, "Not found")
+    auth_header = request.headers.get("authorization", "")
+    provided = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
+    if not provided or not hmac.compare_digest(provided, METRICS_TOKEN):
+        raise HTTPException(401, "Invalid or missing bearer token")
+    return PlainTextResponse(render_prometheus_metrics(), media_type="text/plain; version=0.0.4")
+
+
 @app.get(f"{router_prefix}/devices")
 def devices(search: str | None = None, status: str | None = None, classification: str | None = None,
             user=Depends(get_current_user)):
@@ -1063,6 +1163,65 @@ def delete_rule(rule_id: int, request: Request, admin=Depends(require_admin)):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Saved filters (EventLogExpert-style filter library) - personal to each
+# user, works the same for the Activity (events) and Audit Log views.
+# Filtering itself happens client-side against an already-fetched page of
+# rows; these endpoints just persist/recall named filter definitions so
+# they don't have to be rebuilt by hand every visit. Any authenticated
+# user can save filters for their own account - no admin restriction,
+# since read-only users can use this on the Activity view too (the Audit
+# Log view is admin-only at the UI level regardless).
+# ---------------------------------------------------------------------------
+
+VALID_FILTER_TARGETS = {"events", "audit"}
+
+
+class SavedFilterCreate(BaseModel):
+    name: str
+    target: str
+    definition: dict
+
+    @field_validator("target")
+    @classmethod
+    def check_target(cls, v):
+        if v not in VALID_FILTER_TARGETS:
+            raise ValueError(f"target must be one of {sorted(VALID_FILTER_TARGETS)}")
+        return v
+
+
+@app.get(f"{router_prefix}/saved-filters")
+def list_saved_filters(target: str | None = None, user=Depends(get_current_user)):
+    query = "SELECT * FROM saved_filters WHERE user_id=?"
+    values = [user["id"]]
+    if target in VALID_FILTER_TARGETS:
+        query += " AND target=?"
+        values.append(target)
+    query += " ORDER BY id DESC"
+    with db() as c:
+        rows = c.execute(query, values).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post(f"{router_prefix}/saved-filters")
+def create_saved_filter(payload: SavedFilterCreate, user=Depends(get_current_user)):
+    with db() as c:
+        c.execute(
+            "INSERT INTO saved_filters(user_id,target,name,definition,created_at) VALUES(?,?,?,?,?)",
+            (user["id"], payload.target, payload.name, json.dumps(payload.definition), now()),
+        )
+    return {"ok": True}
+
+
+@app.delete(f"{router_prefix}/saved-filters/{{filter_id}}")
+def delete_saved_filter(filter_id: int, user=Depends(get_current_user)):
+    with db() as c:
+        cur = c.execute("DELETE FROM saved_filters WHERE id=? AND user_id=?", (filter_id, user["id"]))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Saved filter not found")
+    return {"ok": True}
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     banner_html = LOGIN_BANNER.replace("<", "&lt;").replace(">", "&gt;") if LOGIN_BANNER else ""
@@ -1078,7 +1237,7 @@ DASHBOARD = r'''<!doctype html>
 <style>
 :root{color-scheme:dark;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}*{box-sizing:border-box}body{margin:0;background:#070b12;color:#e8eef7}header{position:sticky;top:0;z-index:5;background:rgba(7,11,18,.94);backdrop-filter:blur(14px);border-bottom:1px solid #1d2838;padding:16px 4%;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.brand{display:flex;gap:12px;align-items:center}.eye{width:38px;height:38px;border-radius:12px;background:#182338;display:grid;place-items:center;font-size:21px}.brand b{font-size:20px;letter-spacing:.08em}.muted{color:#7f8da3;font-size:12px}button,.filter{border:1px solid #2b3a52;background:#111a28;color:#dbe7f7;border-radius:9px;padding:9px 13px;cursor:pointer}button.primary{background:#2563eb;border-color:#2563eb}button.danger{background:#3a1522;border-color:#5c2436;color:#ff8194}button.link{background:none;border:none;color:#7f9fd8;padding:4px 6px}.headerRight{display:flex;gap:10px;align-items:center}.wrap{max-width:1500px;margin:auto;padding:28px 4%}.hero{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:22px}.hero h1{font-size:32px;margin:0 0 5px}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}.card{background:linear-gradient(145deg,#101927,#0d141f);border:1px solid #1d2a3d;border-radius:14px;padding:18px}.label{color:#8090a7;font-size:12px;text-transform:uppercase;letter-spacing:.1em}.num{font-size:32px;font-weight:750;margin-top:7px}.green{color:#50e3a4}.yellow{color:#f7c948}.red{color:#ff6b81}.toolbar{display:flex;gap:9px;margin:22px 0;flex-wrap:wrap}.toolbar input{flex:1;min-width:220px}.input{background:#0d141f;border:1px solid #2b3a52;border-radius:9px;padding:10px;color:#e8eef7}.panel{background:#0d141f;border:1px solid #1d2a3d;border-radius:14px;overflow:hidden;margin-top:18px}.panel h2{font-size:16px;margin:0;padding:16px 18px;border-bottom:1px solid #1d2a3d;display:flex;justify-content:space-between;align-items:center}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 14px;border-bottom:1px solid #182335;font-size:13px}th{color:#72819a;font-size:11px;text-transform:uppercase;letter-spacing:.08em}tr:hover{background:#111a27}.dot{font-size:10px}.online{color:#50e3a4}.offline{color:#68758a}.suspected_offline{color:#f7c948}.pill{border:1px solid #31415a;border-radius:999px;padding:3px 8px;font-size:11px;color:#9eb0c8;cursor:pointer;background:none}.known{color:#50e3a4;border-color:#245c49}.new{color:#f7c948;border-color:#6d5a24}.investigate{color:#ff8194;border-color:#6d2e3c}.ignored{color:#72819a}.admin{color:#f7c948;border-color:#6d5a24}.readonly{color:#7f9fd8;border-color:#28406d}.critical{color:#ff8194;border-color:#6d2e3c}.warning{color:#f7c948;border-color:#6d5a24}.info{color:#7f9fd8;border-color:#28406d}.name{font-weight:650}.empty{padding:35px;text-align:center;color:#72819a}.healthbar{font-size:12px;padding:8px 4%;border-bottom:1px solid #1d2838}.healthbar.ok{color:#50e3a4}.healthbar.bad{color:#ff8194}
 .overlay{position:fixed;inset:0;background:#070b12;display:grid;place-items:center;z-index:50;padding:20px}.authcard{width:100%;max-width:360px;background:#101927;border:1px solid #1d2a3d;border-radius:16px;padding:28px}.authcard h2{margin:0 0 6px}.authcard form{display:flex;flex-direction:column;gap:11px;margin-top:18px}.authcard .input{width:100%}.err{color:#ff8194;font-size:13px;min-height:18px}.formRow{display:flex;gap:9px}.userForm{display:flex;gap:8px;padding:14px 18px;flex-wrap:wrap;border-bottom:1px solid #182335}.userForm .input{flex:1;min-width:120px}
-.shell{display:flex;align-items:flex-start}.sidebar{width:230px;flex-shrink:0;background:#0a0f18;border-right:1px solid #1d2838;padding:18px 0;display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto}.sidebar .brand{padding:0 18px 16px;margin-bottom:8px;border-bottom:1px solid #1d2838}.navlist{display:flex;flex-direction:column}.navitem{display:flex;align-items:center;gap:10px;padding:11px 18px;color:#9eb0c8;background:none;border:none;border-left:3px solid transparent;text-align:left;cursor:pointer;font-size:14px;width:100%}.navitem:hover{background:#111a28;color:#e8eef7}.navitem.active{background:#111a28;color:#e8eef7;border-left-color:#2563eb}.sidebar-footer{margin-top:auto;padding:14px 18px 4px;border-top:1px solid #1d2838;display:flex;flex-direction:column;gap:8px}.content{flex:1;min-width:0}
+.shell{display:flex;align-items:flex-start}.sidebar{width:230px;flex-shrink:0;background:#0a0f18;border-right:1px solid #1d2838;padding:18px 0;display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto}.sidebar .brand{padding:0 18px 16px;margin-bottom:8px;border-bottom:1px solid #1d2838}.navlist{display:flex;flex-direction:column}.navitem{display:flex;align-items:center;gap:10px;padding:11px 18px;color:#9eb0c8;background:none;border:none;border-left:3px solid transparent;text-align:left;cursor:pointer;font-size:14px;width:100%}.navitem:hover{background:#111a28;color:#e8eef7}.navitem.active{background:#111a28;color:#e8eef7;border-left-color:#2563eb}.sidebar-footer{margin-top:auto;padding:14px 18px 4px;border-top:1px solid #1d2838;display:flex;flex-direction:column;gap:8px}.content{flex:1;min-width:0}.filterRow{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}.filterRow .input{flex:1;min-width:120px}.filterRow .filter{flex-shrink:0}.savedFilterChip{cursor:pointer;user-select:none}.savedFilterChip:hover{border-color:#4b5f82}.colorInput{width:38px;height:34px;padding:2px;border-radius:6px;border:1px solid #2b3a52;background:#0d141f;flex-shrink:0}
 @media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}th:nth-child(5),td:nth-child(5),th:nth-child(6),td:nth-child(6){display:none}}@media(max-width:600px){.cards{grid-template-columns:1fr}.hero{align-items:start;flex-direction:column}th:nth-child(4),td:nth-child(4){display:none}.wrap{padding:20px 3%}}
 @media(max-width:820px){.shell{flex-direction:column}.sidebar{width:100%;height:auto;position:sticky;top:0;flex-direction:column;overflow:visible;border-right:none;border-bottom:1px solid #1d2838;padding:8px 0;z-index:6}.sidebar .brand{display:none}.navlist{flex-direction:row;overflow-x:auto;padding:0 4%}.navitem{width:auto;white-space:nowrap;border-left:none;border-bottom:3px solid transparent;padding:8px 12px}.navitem.active{border-left:none;border-bottom-color:#2563eb}.sidebar-footer{margin-top:8px;flex-direction:row;border-top:1px solid #1d2838;padding:8px 4% 0;gap:10px;align-items:center;flex-wrap:wrap}.sidebar-footer #whoami{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sidebar-footer #scanBtn{width:auto!important;margin-bottom:0!important}}
 </style></head>
@@ -1150,6 +1309,24 @@ DASHBOARD = r'''<!doctype html>
 </div>
 
 <div class="view" id="view-activity" style="display:none">
+<section class="panel" style="margin-bottom:14px"><h2>Filter</h2>
+<div style="padding:14px 18px;display:flex;flex-direction:column;gap:10px">
+<div id="conditions-events"></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+<button class="link" onclick="addCondition('events')">+ Add condition</button>
+<select class="filter" id="join-events" onchange="setJoin('events',this.value)"><option value="AND">Match ALL (AND)</option><option value="OR">Match ANY (OR)</option></select>
+<select class="filter" id="mode-events" onchange="setMode('events',this.value)"><option value="include">Include matches</option><option value="exclude">Exclude matches</option></select>
+<button class="link" onclick="clearFilter('events')">Clear</button>
+<span class="muted" id="eventsMatchCount" style="margin-left:auto"></span>
+</div>
+<div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:4px">Highlight rules</div>
+<div id="highlights-events"></div>
+<button class="link" onclick="addHighlight('events')" style="align-self:flex-start">+ Add highlight rule</button>
+<div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:4px">Saved filters</div>
+<div id="savedFilters-events" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"></div>
+<button class="primary" style="align-self:flex-start" onclick="saveCurrentFilter('events')">Save current filter</button>
+</div>
+</section>
 <section class="panel"><h2>Recent Activity</h2><div style="overflow:auto"><table><thead><tr><th>Time</th><th>Event</th><th>Device</th><th>IP</th><th>Details</th></tr></thead><tbody id="events"></tbody></table></div></section>
 </div>
 
@@ -1179,6 +1356,24 @@ DASHBOARD = r'''<!doctype html>
 </div>
 
 <div class="view" id="view-audit" style="display:none">
+<section class="panel" style="margin-bottom:14px"><h2>Filter</h2>
+<div style="padding:14px 18px;display:flex;flex-direction:column;gap:10px">
+<div id="conditions-audit"></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+<button class="link" onclick="addCondition('audit')">+ Add condition</button>
+<select class="filter" id="join-audit" onchange="setJoin('audit',this.value)"><option value="AND">Match ALL (AND)</option><option value="OR">Match ANY (OR)</option></select>
+<select class="filter" id="mode-audit" onchange="setMode('audit',this.value)"><option value="include">Include matches</option><option value="exclude">Exclude matches</option></select>
+<button class="link" onclick="clearFilter('audit')">Clear</button>
+<span class="muted" id="auditMatchCount" style="margin-left:auto"></span>
+</div>
+<div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:4px">Highlight rules</div>
+<div id="highlights-audit"></div>
+<button class="link" onclick="addHighlight('audit')" style="align-self:flex-start">+ Add highlight rule</button>
+<div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:4px">Saved filters</div>
+<div id="savedFilters-audit" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"></div>
+<button class="primary" style="align-self:flex-start" onclick="saveCurrentFilter('audit')">Save current filter</button>
+</div>
+</section>
 <section class="panel" id="auditPanel"><h2>Audit Log</h2>
 <div style="overflow:auto"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th><th>IP</th></tr></thead><tbody id="auditRows"></tbody></table></div>
 </section>
@@ -1191,6 +1386,37 @@ DASHBOARD = r'''<!doctype html>
 const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const CLASS_CYCLE={new:'known',known:'ignored',ignored:'investigate',investigate:'new'};
 const CLASS_LABEL={new:'New',known:'Known',ignored:'Ignored',investigate:'Investigate'};
+// --- EventLogExpert-style filter engine for Activity/Audit views ---
+const FILTER_FIELDS={events:[['event_type','Event type'],['severity','Severity'],['mac','MAC'],['ip','IP'],['details','Details']],audit:[['actor','Actor'],['action','Action'],['target','Target'],['details','Details'],['ip','IP']]};
+let ALL_EVENTS=[],ALL_AUDIT=[];
+let FILTER_STATE={events:{conditions:[],join:'AND',mode:'include',highlights:[]},audit:{conditions:[],join:'AND',mode:'include',highlights:[]}};
+let SAVED_FILTERS={events:[],audit:[]};
+function condMatches(row,cond){const v=(row[cond.field]??'').toString().toLowerCase();const cv=(cond.value??'').toString().toLowerCase();if(cond.op==='equals')return v===cv;if(cond.op==='not_equals')return v!==cv;if(cond.op==='not_contains')return !v.includes(cv);return v.includes(cv)}
+function groupMatches(row,conditions,join){const active=conditions.filter(c=>c.value!=='');if(!active.length)return true;return join==='OR'?active.some(c=>condMatches(row,c)):active.every(c=>condMatches(row,c))}
+function applyFilterRows(rows,state){if(!state.conditions.length)return rows;return rows.filter(r=>{const m=groupMatches(r,state.conditions,state.join);return state.mode==='exclude'?!m:m})}
+function highlightColor(row,state){for(const h of state.highlights){if(h.value!==''&&condMatches(row,h))return h.color}return null}
+function fieldOptions(target,selected){return FILTER_FIELDS[target].map(([f,label])=>`<option value="${f}" ${f===selected?'selected':''}>${label}</option>`).join('')}
+function opOptions(selected){const ops=[['contains','contains'],['not_contains','does not contain'],['equals','equals'],['not_equals','not equals']];return ops.map(([o,label])=>`<option value="${o}" ${o===selected?'selected':''}>${label}</option>`).join('')}
+function renderFilterBuilder(target){const state=FILTER_STATE[target];const condEl=document.getElementById('conditions-'+target);condEl.innerHTML=state.conditions.map((c,i)=>`<div class="filterRow"><select class="filter" onchange="updateCondition('${target}',${i},'field',this.value)">${fieldOptions(target,c.field)}</select><select class="filter" onchange="updateCondition('${target}',${i},'op',this.value)">${opOptions(c.op)}</select><input class="input" placeholder="value" value="${esc(c.value)}" oninput="updateCondition('${target}',${i},'value',this.value)"><button class="link" onclick="removeCondition('${target}',${i})">✕</button></div>`).join('');const hlEl=document.getElementById('highlights-'+target);hlEl.innerHTML=state.highlights.map((h,i)=>`<div class="filterRow"><select class="filter" onchange="updateHighlight('${target}',${i},'field',this.value)">${fieldOptions(target,h.field)}</select><select class="filter" onchange="updateHighlight('${target}',${i},'op',this.value)">${opOptions(h.op)}</select><input class="input" placeholder="value" value="${esc(h.value)}" oninput="updateHighlight('${target}',${i},'value',this.value)"><input type="color" class="colorInput" value="${h.color}" onchange="updateHighlight('${target}',${i},'color',this.value)"><button class="link" onclick="removeHighlight('${target}',${i})">✕</button></div>`).join('')}
+function syncFilterControls(target){const j=document.getElementById('join-'+target);const m=document.getElementById('mode-'+target);if(j)j.value=FILTER_STATE[target].join;if(m)m.value=FILTER_STATE[target].mode}
+function addCondition(target){FILTER_STATE[target].conditions.push({field:FILTER_FIELDS[target][0][0],op:'contains',value:''});renderFilterBuilder(target)}
+function removeCondition(target,idx){FILTER_STATE[target].conditions.splice(idx,1);renderFilterBuilder(target);applyAndRender(target)}
+function updateCondition(target,idx,key,val){FILTER_STATE[target].conditions[idx][key]=val;applyAndRender(target)}
+function addHighlight(target){FILTER_STATE[target].highlights.push({field:FILTER_FIELDS[target][0][0],op:'contains',value:'',color:'#ff8194'});renderFilterBuilder(target)}
+function removeHighlight(target,idx){FILTER_STATE[target].highlights.splice(idx,1);renderFilterBuilder(target);applyAndRender(target)}
+function updateHighlight(target,idx,key,val){FILTER_STATE[target].highlights[idx][key]=val;applyAndRender(target)}
+function setJoin(target,val){FILTER_STATE[target].join=val;applyAndRender(target)}
+function setMode(target,val){FILTER_STATE[target].mode=val;applyAndRender(target)}
+function clearFilter(target){FILTER_STATE[target]={conditions:[],join:'AND',mode:'include',highlights:[]};renderFilterBuilder(target);syncFilterControls(target);applyAndRender(target)}
+function applyAndRender(target){if(target==='events')renderEvents();else renderAudit()}
+function renderEvents(){const state=FILTER_STATE.events;const filtered=applyFilterRows(ALL_EVENTS,state);events.innerHTML=filtered.length?filtered.map(x=>{const hl=highlightColor(x,state);const style=hl?` style="background:${hl}22;border-left:3px solid ${hl}"`:'';return `<tr${style}><td>${esc(new Date(x.created_at).toLocaleString())}</td><td><span class="pill">${esc(x.event_type)}</span></td><td>${esc(x.mac||'—')}</td><td>${esc(x.ip||'—')}</td><td>${esc(x.details)}</td></tr>`}).join(''):'<tr><td colspan="5" class="empty">No activity matches this filter.</td></tr>';const c=document.getElementById('eventsMatchCount');if(c)c.textContent=filtered.length+' / '+ALL_EVENTS.length+' shown'}
+function renderAudit(){const state=FILTER_STATE.audit;const filtered=applyFilterRows(ALL_AUDIT,state);auditRows.innerHTML=filtered.length?filtered.map(x=>{const hl=highlightColor(x,state);const style=hl?` style="background:${hl}22;border-left:3px solid ${hl}"`:'';return `<tr${style}><td>${esc(new Date(x.created_at).toLocaleString())}</td><td>${esc(x.actor)}</td><td><span class="pill">${esc(x.action)}</span></td><td>${esc(x.target||'—')}</td><td>${esc(x.details||'')}</td><td>${esc(x.ip||'—')}</td></tr>`}).join(''):'<tr><td colspan="6" class="empty">No audit entries match this filter.</td></tr>';const c=document.getElementById('auditMatchCount');if(c)c.textContent=filtered.length+' / '+ALL_AUDIT.length+' shown'}
+async function loadSavedFilters(target){try{SAVED_FILTERS[target]=await json('/api/v1/saved-filters?target='+target)}catch(e){SAVED_FILTERS[target]=[]}renderSavedFilters(target)}
+function renderSavedFilters(target){const el=document.getElementById('savedFilters-'+target);const list=SAVED_FILTERS[target];el.innerHTML=list.length?list.map(f=>`<span class="pill savedFilterChip"><span onclick="applySavedFilter('${target}',${f.id})">${esc(f.name)}</span> <span onclick="deleteSavedFilter('${target}',${f.id})" style="color:#ff8194">✕</span></span>`).join(' '):'<span class="muted">No saved filters yet.</span>'}
+function applySavedFilter(target,id){const f=SAVED_FILTERS[target].find(x=>x.id===id);if(!f)return;let def;try{def=JSON.parse(f.definition)}catch(e){return}FILTER_STATE[target]=Object.assign({conditions:[],join:'AND',mode:'include',highlights:[]},def);renderFilterBuilder(target);syncFilterControls(target);applyAndRender(target)}
+async function saveCurrentFilter(target){const name=prompt('Name this filter:');if(!name)return;try{await json('/api/v1/saved-filters',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,target:target,definition:FILTER_STATE[target]})});await loadSavedFilters(target)}catch(e){alert('Could not save filter: '+e.message)}}
+async function deleteSavedFilter(target,id){try{await json('/api/v1/saved-filters/'+id,{method:'DELETE'});await loadSavedFilters(target)}catch(e){}}
+
 let ME=null;
 let PENDING_MFA_TOKEN=null;
 function getCookie(name){const m=document.cookie.match('(?:^|; )'+name+'=([^;]*)');return m?decodeURIComponent(m[1]):null}
@@ -1205,7 +1431,7 @@ async function doChangePassword(e){e.preventDefault();const err=document.getElem
 async function logout(){await fetch('/api/v1/auth/logout',{method:'POST',headers:{'X-CSRF-Token':getCookie('godseye_csrf')||''}});showLogin()}
 async function loadDevices(){let q=new URLSearchParams();if(search.value)q.set('search',search.value);if(status.value)q.set('status',status.value);if(classification.value)q.set('classification',classification.value);let d=await json('/api/v1/devices?'+q);const canEdit=ME&&ME.role==='admin';devices.innerHTML=d.length?d.map(x=>`<tr><td class="${esc(x.status)}"><span class="dot">●</span> ${esc(x.status).replace('_',' ')}</td><td><div class="name">${esc(x.name||x.hostname||'Unknown device')}</div><div class="muted">${esc(x.device_type||'Unclassified')}</div></td><td>${esc(x.ip)}</td><td>${esc(x.mac)}</td><td>${esc(x.vendor||'—')}</td><td><button class="pill ${esc(x.classification)}" ${canEdit?`onclick="cycleClass(${x.id},'${x.classification}')"`:'disabled'}>${CLASS_LABEL[x.classification]||x.classification}</button></td></tr>`).join(''):'<tr><td colspan="6" class="empty">No devices match this filter.</td></tr>'}
 async function loadUsers(){if(!ME||ME.role!=='admin'){usersPanel.style.display='none';return}usersPanel.style.display='block';let u=await json('/api/v1/users');users.innerHTML=u.map(x=>{let mustChange=x.must_change_password?(x.must_change_password_by?`yes, by ${esc(new Date(x.must_change_password_by).toLocaleDateString())}`:'yes'):'no';return `<tr><td>${esc(x.username)}</td><td><span class="pill ${esc(x.role)}">${esc(x.role)}</span></td><td>${esc(new Date(x.created_at).toLocaleDateString())}</td><td>${x.last_login_at?esc(new Date(x.last_login_at).toLocaleString()):'never'}</td><td>${x.password_changed_at?esc(new Date(x.password_changed_at).toLocaleDateString()):'—'}</td><td>${mustChange}</td><td>${x.mfa_enabled?'yes':'no'}</td><td>${x.username===ME.username?'':`<button class="link" onclick="removeUser(${x.id},'${esc(x.username)}')">Remove</button>${x.mfa_enabled?` <button class="link" onclick="resetUserMfa(${x.id},'${esc(x.username)}')">Reset MFA</button>`:''}`}</td></tr>`}).join('')}
-async function loadAudit(){if(!ME||ME.role!=='admin'){auditPanel.style.display='none';return}auditPanel.style.display='block';let a=await json('/api/v1/audit?limit=50');auditRows.innerHTML=a.length?a.map(x=>`<tr><td>${esc(new Date(x.created_at).toLocaleString())}</td><td>${esc(x.actor)}</td><td><span class="pill">${esc(x.action)}</span></td><td>${esc(x.target||'—')}</td><td>${esc(x.details||'')}</td><td>${esc(x.ip||'—')}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">No audit entries yet.</td></tr>'}
+async function loadAudit(){if(!ME||ME.role!=='admin'){auditPanel.style.display='none';return}auditPanel.style.display='block';ALL_AUDIT=await json('/api/v1/audit?limit=300');renderAudit()}
 async function loadSecurity(){const el=document.getElementById('mfaStatus');if(ME.mfa_enabled){el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#50e3a4">enabled</b> on this account.</div><button class="link" style="margin-top:10px" onclick="startMfaDisable()">Disable MFA</button>`}else{el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#f7c948">not enabled</b>. Add it for a second layer of protection beyond your password.</div><button class="primary" style="margin-top:10px" onclick="startMfaSetup()">Set up MFA</button>`}}
 function updateRuleFields(){const t=document.getElementById('ruleType').value;document.getElementById('ruleFieldsBurst').style.display=t==='new_device_burst'?'flex':'none';document.getElementById('ruleFieldsOffline').style.display=t==='offline_duration'?'flex':'none'}
 async function loadRules(){if(!ME||ME.role!=='admin'){rulesPanel.style.display='none';return}rulesPanel.style.display='block';let r=await json('/api/v1/rules');rules.innerHTML=r.length?r.map(x=>{let p;try{p=JSON.parse(x.params)}catch(e){p={}}let cond=x.rule_type==='new_device_burst'?`${p.count}+ new devices in ${p.window_minutes}m`:`offline ${p.minutes}m+ (${(p.classifications&&p.classifications.length?p.classifications:['any']).join(', ')})`;return `<tr><td>${esc(x.name)}</td><td>${esc(x.rule_type)}</td><td>${esc(cond)}</td><td><span class="pill ${esc(x.severity)}">${esc(x.severity)}</span></td><td>${x.last_triggered_at?esc(new Date(x.last_triggered_at).toLocaleString()):'never'}</td><td><input type="checkbox" ${x.enabled?'checked':''} onchange="toggleRule(${x.id},this.checked)"></td><td><button class="link" onclick="removeRule(${x.id},'${esc(x.name)}')">Remove</button></td></tr>`}).join(''):'<tr><td colspan="7" class="empty">No rules configured yet.</td></tr>'}
@@ -1219,9 +1445,9 @@ async function confirmMfaDisable(e){e.preventDefault();const err=document.getEle
 async function resetUserMfa(id,username){if(!confirm('Reset MFA for "'+username+'"? They will need to set it up again.'))return;await json('/api/v1/users/'+id+'/mfa/reset',{method:'POST'});await loadUsers()}
 async function createUser(e){e.preventDefault();try{await json('/api/v1/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:newUsername.value,password:newUserPassword.value,role:newUserRole.value})});newUsername.value='';newUserPassword.value='';await loadUsers()}catch(e){alert('Could not create user: '+e.message)}return false}
 async function removeUser(id,username){if(!confirm('Remove user "'+username+'"?'))return;await json('/api/v1/users/'+id,{method:'DELETE'});await loadUsers()}
-async function load(){let h=await json('/api/v1/health');total.textContent=h.total;online.textContent=h.online;unknown.textContent=h.needs_review;eventsCount.textContent=h.events;updated.textContent='Last refreshed '+new Date().toLocaleTimeString();lastScan.textContent=h.scanner.detail;const hb=document.getElementById('healthbar');if(!h.scanner.healthy){hb.className='healthbar bad';hb.textContent='⚠ Scanner unhealthy — '+h.scanner.detail;hb.style.display='block'}else{hb.style.display='none'}await loadDevices();let e=await json('/api/v1/events?limit=30');events.innerHTML=e.length?e.map(x=>`<tr><td>${esc(new Date(x.created_at).toLocaleString())}</td><td><span class="pill">${esc(x.event_type)}</span></td><td>${esc(x.mac)}</td><td>${esc(x.ip)}</td><td>${esc(x.details)}</td></tr>`).join(''):'<tr><td colspan="5" class="empty">No activity yet.</td></tr>'}
+async function load(){let h=await json('/api/v1/health');total.textContent=h.total;online.textContent=h.online;unknown.textContent=h.needs_review;eventsCount.textContent=h.events;updated.textContent='Last refreshed '+new Date().toLocaleTimeString();lastScan.textContent=h.scanner.detail;const hb=document.getElementById('healthbar');if(!h.scanner.healthy){hb.className='healthbar bad';hb.textContent='⚠ Scanner unhealthy — '+h.scanner.detail;hb.style.display='block'}else{hb.style.display='none'}await loadDevices();ALL_EVENTS=await json('/api/v1/events?limit=300');renderEvents()}
 async function cycleClass(id,current){await json('/api/v1/devices/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({classification:CLASS_CYCLE[current]||'new'})});load()}
 async function scan(){await json('/api/v1/scan',{method:'POST'});updated.textContent='Scan requested…';setTimeout(load,3000)}
-async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';['navRules','navUsers','navAudit'].forEach(id=>{document.getElementById(id).style.display=ME.role==='admin'?'':'none'});const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();setInterval(load,10000)}
+async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';['navRules','navUsers','navAudit'].forEach(id=>{document.getElementById(id).style.display=ME.role==='admin'?'':'none'});const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}renderFilterBuilder('events');syncFilterControls('events');renderFilterBuilder('audit');syncFilterControls('audit');showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();await loadSavedFilters('events');if(ME.role==='admin')await loadSavedFilters('audit');setInterval(load,10000)}
 boot();
 </script></body></html>'''

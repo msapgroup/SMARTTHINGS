@@ -2,8 +2,10 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.11
+## Current release: 0.13
 
+- Optional Prometheus-compatible `/metrics` endpoint (device/event/user/rule counts, scanner health) — off by default, requires a bearer token to enable
+- EventLogExpert-inspired filtering on the Activity and Audit Log views — AND/OR conditions, include/exclude mode, color highlight rules, and a personal saved Filter Library per user
 - Left sidebar navigation (Pi-Alert style) — Overview, Activity, Security, Alert Rules, Users, and Audit Log as separate views instead of one long scrolling page; collapses to a horizontally-scrollable top bar on mobile
 - Automatic ARP LAN discovery with `arp-scan`, plus reverse-DNS hostname lookup and an ICMP ping cross-check to reduce false offline events
 - Alert rule engine — new-device burst detection and classification-aware offline-duration escalation, on top of the existing webhook/ntfy/email channels
@@ -40,6 +42,10 @@
 <p>
   <img src="docs/screenshots/rules.png" width="700" alt="Alert Rules view"><br>
   <em>Alert Rules - configure new-device-burst and offline-duration rules</em>
+</p>
+<p>
+  <img src="docs/screenshots/activity-filters.png" width="700" alt="Activity view with EventLogExpert-style filtering and highlight rules"><br>
+  <em>Activity - AND/OR condition filtering, include/exclude mode, and color highlight rules (EventLogExpert-inspired)</em>
 </p>
 <p>
   <img src="docs/screenshots/mfa-setup.png" width="700" alt="Two-factor authentication setup"><br>
@@ -169,6 +175,7 @@ Set these as `Environment=` lines in the systemd unit files (or export them befo
 | `GODSEYE_SMTP_HOST` / `PORT` / `USER` / `PASSWORD` / `FROM` / `TO` | *(empty, disabled)* | scanner | SMTP settings for email alerts |
 | `GODSEYE_EMAIL_MIN_SEVERITY` | `critical` | scanner | Minimum severity that triggers an email (defaults higher than the other channels — email is for the events that most need same-shift attention, not a running log) |
 | `GODSEYE_MAX_NOTIFICATIONS_PER_SCAN` | `10` | scanner | Caps outbound notifications per scan cycle, so a burst (e.g. scanner recovering after downtime) can't create a notification storm. Every event is still recorded and visible on the dashboard regardless of this cap — only the *push* is capped. |
+| `GODSEYE_METRICS_TOKEN` | *(empty, disabled)* | web | Enables `/metrics` (Prometheus format) when set; requests must send this value as a bearer token |
 | `GODSEYE_REVERSE_DNS` | `true` | scanner | Look up a hostname via reverse DNS the first time a device is seen |
 | `GODSEYE_REVERSE_DNS_TIMEOUT` | `1.5` | scanner | Seconds to wait for a reverse DNS lookup before giving up |
 | `GODSEYE_PING_CHECK` | `true` | scanner | Before demoting a device ARP didn't see this cycle, give it one more chance via a plain ICMP ping |
@@ -233,6 +240,54 @@ that with conditions on *patterns* rather than single events:
 Both produce a `rule_triggered` event at the severity you configure,
 which flows through the same webhook/ntfy/email channels as any other
 event — no separate plumbing to configure.
+
+## Activity and Audit Log filtering
+
+The Activity and Audit Log views (as of 0.12) support EventLogExpert-style
+filtering, entirely client-side against the most recent batch of rows
+(up to 300 events / 300 audit entries — plenty for a home or small-business
+deployment; this isn't built for querying years of history):
+
+- **Conditions** — pick a field (event type, severity, MAC, IP, details,
+  or actor/action/target for audit), an operator (contains / does not
+  contain / equals / not equals), and a value. Multiple conditions can be
+  joined with **AND** (match all) or **OR** (match any).
+- **Include / Exclude mode** — show only matching rows, or hide them and
+  show everything else.
+- **Highlight rules** — separate from the include/exclude filter: color
+  matching rows without hiding anything else, so you can eyeball patterns
+  (e.g. tint every `critical` event red) while still seeing full context.
+- **Filter Library** — save a named filter (conditions + highlights) and
+  reapply it with one click later. Saved filters are personal to your
+  account — each user has their own library, stored server-side so it
+  follows you across devices rather than being stuck in one browser's
+  local storage.
+
+## Metrics
+
+An optional Prometheus-compatible `/metrics` endpoint (as of 0.13) exposes
+device counts (by status and classification), event counts (by severity),
+user and rule counts, and scanner health as standard Prometheus gauges and
+counters — useful if you're already running Prometheus/Grafana and want
+GODSEYE alongside your other dashboards, or NetAlertX-style metrics
+export without NetAlertX itself.
+
+It's **off by default** rather than open on the LAN without a credential:
+a scraper can't do the cookie-based login the dashboard uses, so it needs
+its own auth story. Set `GODSEYE_METRICS_TOKEN` to enable it, and
+configure the same value as a bearer token in your scrape config:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: godseye
+    bearer_token: your-token-here
+    static_configs:
+      - targets: ["<pi-ip>:8080"]
+```
+
+With no token set, `/metrics` returns 404 rather than exposing device
+inventory data to anyone who can reach the port.
 
 ## Discovery methods
 

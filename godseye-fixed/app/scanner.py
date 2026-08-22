@@ -171,12 +171,21 @@ def init_db():
             created_at TEXT NOT NULL,
             last_triggered_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS saved_filters (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            target TEXT NOT NULL,
+            name TEXT NOT NULL,
+            definition TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_pwhistory_user ON password_history(user_id);
         CREATE INDEX IF NOT EXISTS idx_backupcodes_user ON mfa_backup_codes(user_id);
+        CREATE INDEX IF NOT EXISTS idx_savedfilters_user ON saved_filters(user_id);
         """)
         # Additive, idempotent migrations for installs created before these columns existed.
         # (A real migration framework - versioned, ordered scripts - belongs on the roadmap;

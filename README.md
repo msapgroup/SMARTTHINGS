@@ -2,8 +2,9 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.12
+## Current release: 0.13
 
+- Optional Prometheus-compatible `/metrics` endpoint (device/event/user/rule counts, scanner health) — off by default, requires a bearer token to enable
 - EventLogExpert-inspired filtering on the Activity and Audit Log views — AND/OR conditions, include/exclude mode, color highlight rules, and a personal saved Filter Library per user
 - Left sidebar navigation (Pi-Alert style) — Overview, Activity, Security, Alert Rules, Users, and Audit Log as separate views instead of one long scrolling page; collapses to a horizontally-scrollable top bar on mobile
 - Automatic ARP LAN discovery with `arp-scan`, plus reverse-DNS hostname lookup and an ICMP ping cross-check to reduce false offline events
@@ -174,6 +175,7 @@ Set these as `Environment=` lines in the systemd unit files (or export them befo
 | `GODSEYE_SMTP_HOST` / `PORT` / `USER` / `PASSWORD` / `FROM` / `TO` | *(empty, disabled)* | scanner | SMTP settings for email alerts |
 | `GODSEYE_EMAIL_MIN_SEVERITY` | `critical` | scanner | Minimum severity that triggers an email (defaults higher than the other channels — email is for the events that most need same-shift attention, not a running log) |
 | `GODSEYE_MAX_NOTIFICATIONS_PER_SCAN` | `10` | scanner | Caps outbound notifications per scan cycle, so a burst (e.g. scanner recovering after downtime) can't create a notification storm. Every event is still recorded and visible on the dashboard regardless of this cap — only the *push* is capped. |
+| `GODSEYE_METRICS_TOKEN` | *(empty, disabled)* | web | Enables `/metrics` (Prometheus format) when set; requests must send this value as a bearer token |
 | `GODSEYE_REVERSE_DNS` | `true` | scanner | Look up a hostname via reverse DNS the first time a device is seen |
 | `GODSEYE_REVERSE_DNS_TIMEOUT` | `1.5` | scanner | Seconds to wait for a reverse DNS lookup before giving up |
 | `GODSEYE_PING_CHECK` | `true` | scanner | Before demoting a device ARP didn't see this cycle, give it one more chance via a plain ICMP ping |
@@ -260,6 +262,32 @@ deployment; this isn't built for querying years of history):
   account — each user has their own library, stored server-side so it
   follows you across devices rather than being stuck in one browser's
   local storage.
+
+## Metrics
+
+An optional Prometheus-compatible `/metrics` endpoint (as of 0.13) exposes
+device counts (by status and classification), event counts (by severity),
+user and rule counts, and scanner health as standard Prometheus gauges and
+counters — useful if you're already running Prometheus/Grafana and want
+GODSEYE alongside your other dashboards, or NetAlertX-style metrics
+export without NetAlertX itself.
+
+It's **off by default** rather than open on the LAN without a credential:
+a scraper can't do the cookie-based login the dashboard uses, so it needs
+its own auth story. Set `GODSEYE_METRICS_TOKEN` to enable it, and
+configure the same value as a bearer token in your scrape config:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: godseye
+    bearer_token: your-token-here
+    static_configs:
+      - targets: ["<pi-ip>:8080"]
+```
+
+With no token set, `/metrics` returns 404 rather than exposing device
+inventory data to anyone who can reach the port.
 
 ## Discovery methods
 
