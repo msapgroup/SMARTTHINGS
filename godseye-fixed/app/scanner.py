@@ -48,6 +48,18 @@ REVERSE_DNS_TIMEOUT = float(os.environ.get("GODSEYE_REVERSE_DNS_TIMEOUT", "1.5")
 PING_ENABLED = os.environ.get("GODSEYE_PING_CHECK", "true").lower() == "true"
 PING_TIMEOUT_SECONDS = int(os.environ.get("GODSEYE_PING_TIMEOUT", "1"))
 
+# DHCP lease file parsing: opt-in, since it only works where GODSEYE actually
+# has read access to a DHCP server's lease file (e.g. running alongside
+# Pi-hole/dnsmasq, or on pfSense/OPNsense where dnsmasq is the DHCP server).
+# Most home setups have the router itself as the DHCP server with no lease
+# file exposed to the Pi at all - this is enrichment for the setups where it
+# IS available, not something that works everywhere the way ARP does.
+# Unlike the ping/reverse-DNS signals, a DHCP lease is NOT used as a
+# liveness signal (a lease can outlive the device actually being present),
+# only as a hostname enrichment source - same trust level as reverse DNS.
+DHCP_LEASES_FILE = os.environ.get("GODSEYE_DHCP_LEASES_FILE", "")
+DHCP_LEASES_FORMAT = os.environ.get("GODSEYE_DHCP_LEASES_FORMAT", "dnsmasq")
+
 VALID_CLASSIFICATIONS = {"new", "known", "ignored", "investigate"}
 
 
@@ -245,6 +257,41 @@ def ping_reachable(ip: str) -> bool:
         return False
 
 
+_MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+
+
+def load_dhcp_leases() -> dict:
+    """Best-effort read of a DHCP server's lease file, returning
+    {mac_lowercase: hostname}. Returns {} if not configured, unreadable, or
+    empty - callers should treat this purely as an optional enrichment
+    source, never as a required one. Only 'dnsmasq' format is supported
+    today (used by dnsmasq itself, and by Pi-hole and OpenWrt, both of
+    which run dnsmasq as their DHCP server); other DHCP servers use
+    different lease file formats and aren't parsed by this function.
+    """
+    if not DHCP_LEASES_FILE:
+        return {}
+    if DHCP_LEASES_FORMAT != "dnsmasq":
+        print(f"[GODSEYE] GODSEYE_DHCP_LEASES_FORMAT={DHCP_LEASES_FORMAT!r} is not supported (only 'dnsmasq' is)")
+        return {}
+    leases = {}
+    try:
+        with open(DHCP_LEASES_FILE, "r") as f:
+            for line in f:
+                fields = line.split()
+                # dnsmasq.leases: <expiry-epoch> <mac> <ip> <hostname-or-'*'> <client-id-or-'*'>
+                if len(fields) < 4:
+                    continue
+                mac, hostname = fields[1], fields[3]
+                if _MAC_RE.match(mac) and hostname and hostname != "*":
+                    leases[mac.lower()] = hostname
+    except FileNotFoundError:
+        print(f"[GODSEYE] DHCP leases file not found: {DHCP_LEASES_FILE}")
+    except Exception as exc:
+        print(f"[GODSEYE] could not read DHCP leases file: {exc}")
+    return leases
+
+
 def scan():
     # Returns None when the scan could not be performed at all (so the caller
     # must NOT treat it as "no devices found"), and a list (possibly empty)
@@ -273,7 +320,7 @@ def _log_event(c, mac, event_type, ip, timestamp, details, severity="info"):
             "details": details, "severity": severity}
 
 
-def record_scan(found):
+def record_scan(found, dhcp_leases=None):
     """Apply one scan cycle's results using a three-state device lifecycle
     (online -> suspected_offline -> offline) instead of flipping straight to
     offline on the first missed scan. This absorbs normal flakiness (Wi-Fi
@@ -281,19 +328,19 @@ def record_scan(found):
     false disconnect events, while still surfacing genuinely offline devices
     after OFFLINE_THRESHOLD consecutive misses.
 
-    Two supplementary discovery methods layer on top of the primary ARP
-    scan: reverse DNS fills in a hostname for newly-seen devices (attempted
-    once, at first sight, not every cycle - most IoT devices never get a
-    PTR record and re-trying forever would add latency to every cycle for
-    no benefit), and a ping cross-check gives a device ARP missed this
-    cycle one more chance to prove it's still there before it gets
-    demoted - this is a second, independent discovery signal, not just a
-    retry of the same one.
+    Supplementary discovery methods layer on top of the primary ARP scan:
+    a DHCP lease file (if configured) and reverse DNS both fill in a
+    hostname for newly-seen devices - DHCP checked first since it's a
+    local file read with no network round trip, reverse DNS as a fallback.
+    Both are attempted once, at first sight, not every cycle. A ping
+    cross-check separately gives a device ARP missed this cycle one more
+    chance to prove it's still there before it gets demoted.
 
     Notifications (webhook/ntfy/email) are dispatched after the database
     transaction closes, so a slow or unreachable notification endpoint
     never holds the SQLite write lock open.
     """
+    dhcp_leases = dhcp_leases or {}
     timestamp = now()
     found_macs = set()
     fired_events = []
@@ -304,7 +351,7 @@ def record_scan(found):
             found_macs.add(mac)
             old = existing.get(mac)
             if old is None:
-                hostname = resolve_hostname(d["ip"])
+                hostname = dhcp_leases.get(mac) or resolve_hostname(d["ip"])
                 c.execute(
                     "INSERT INTO devices(mac,ip,hostname,vendor,status,first_seen,last_seen,classification,missed_scans) "
                     "VALUES(?,?,?,?,?,?,?,?,0)",
@@ -467,7 +514,8 @@ def main():
                 print("scan cycle skipped (subnet detection or arp-scan failed); leaving device statuses unchanged")
                 record_heartbeat(success=False, duration_ms=duration_ms, error="scan unavailable")
             else:
-                fired_events += record_scan(found)
+                dhcp_leases = load_dhcp_leases() if DHCP_LEASES_FILE else {}
+                fired_events += record_scan(found, dhcp_leases=dhcp_leases)
                 record_heartbeat(success=True, devices_found=len(found), duration_ms=duration_ms)
             # Rules run every cycle regardless of whether the ARP scan itself
             # succeeded - offline-duration rules depend on stored timestamps

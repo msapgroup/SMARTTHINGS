@@ -361,7 +361,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.13.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.14.0", lifespan=lifespan)
 
 
 @app.middleware("http")

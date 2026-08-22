@@ -2,8 +2,9 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.13
+## Current release: 0.14
 
+- Opt-in DHCP lease file parsing (dnsmasq format) for hostname enrichment — takes priority over reverse DNS when both are available
 - Optional Prometheus-compatible `/metrics` endpoint (device/event/user/rule counts, scanner health) — off by default, requires a bearer token to enable
 - EventLogExpert-inspired filtering on the Activity and Audit Log views — AND/OR conditions, include/exclude mode, color highlight rules, and a personal saved Filter Library per user
 - Left sidebar navigation (Pi-Alert style) — Overview, Activity, Security, Alert Rules, Users, and Audit Log as separate views instead of one long scrolling page; collapses to a horizontally-scrollable top bar on mobile
@@ -180,6 +181,8 @@ Set these as `Environment=` lines in the systemd unit files (or export them befo
 | `GODSEYE_REVERSE_DNS_TIMEOUT` | `1.5` | scanner | Seconds to wait for a reverse DNS lookup before giving up |
 | `GODSEYE_PING_CHECK` | `true` | scanner | Before demoting a device ARP didn't see this cycle, give it one more chance via a plain ICMP ping |
 | `GODSEYE_PING_TIMEOUT` | `1` | scanner | Seconds to wait for a ping reply |
+| `GODSEYE_DHCP_LEASES_FILE` | *(empty, disabled)* | scanner | Path to a DHCP server's lease file for hostname enrichment (only used where GODSEYE has read access to one) |
+| `GODSEYE_DHCP_LEASES_FORMAT` | `dnsmasq` | scanner | Lease file format — only `dnsmasq` is currently supported (also covers Pi-hole and OpenWrt, both dnsmasq-based) |
 
 ## Alerting
 
@@ -292,29 +295,37 @@ inventory data to anyone who can reach the port.
 ## Discovery methods
 
 ARP is still the primary discovery method (it's what actually finds
-devices), but two supplementary signals layer on top of it as of 0.9:
+devices), with three supplementary signals layered on top:
 
-- **Reverse DNS** — arp-scan never gives you a hostname, just MAC/IP/
-  vendor. GODSEYE now does a reverse-DNS (PTR) lookup the first time it
+- **Reverse DNS** (0.9) — arp-scan never gives you a hostname, just MAC/
+  IP/vendor. GODSEYE does a reverse-DNS (PTR) lookup the first time it
   sees a device, since most home routers register local DHCP names in
   their own DNS. Only attempted once, at first sight — not every scan
   cycle — so devices that never get a PTR record (common for IoT gear)
   don't add lookup latency to every cycle forever.
-- **Ping cross-check** — before a device that ARP didn't see this cycle
-  gets marked suspected-offline/offline, it gets one more chance via a
-  plain ICMP ping. This is a second, independent way to confirm a device
-  is actually gone rather than just relying on ARP a second time, and
-  directly reduces false disconnect events from a dropped ARP probe on
-  an otherwise-healthy device.
+- **Ping cross-check** (0.9) — before a device that ARP didn't see this
+  cycle gets marked suspected-offline/offline, it gets one more chance
+  via a plain ICMP ping. This is a second, independent way to confirm a
+  device is actually gone rather than just relying on ARP a second time,
+  and directly reduces false disconnect events from a dropped ARP probe
+  on an otherwise-healthy device.
+- **DHCP lease file parsing** (0.14) — opt-in, since it only works where
+  GODSEYE actually has read access to a DHCP server's lease file (most
+  home setups have the router itself as the DHCP server with no lease
+  file exposed to the Pi at all). Where it *is* available — running
+  alongside Pi-hole, or on pfSense/OPNsense where dnsmasq is the DHCP
+  server — it's a better hostname source than reverse DNS: no network
+  round trip, and it's often populated the moment a device requests an
+  address rather than depending on the router's DNS registering it.
+  Set `GODSEYE_DHCP_LEASES_FILE` to the lease file's path to enable it;
+  DHCP hostnames take priority over reverse DNS when both are available.
+  Only the `dnsmasq` lease file format is currently supported (also used
+  by Pi-hole and OpenWrt, which both run dnsmasq as their DHCP server).
+  Like reverse DNS, this is hostname enrichment only — a lease can
+  outlive a device actually being present, so it's never used as a
+  liveness signal for online/offline status.
 
 **Deliberately not built yet, and why:**
-- **DHCP lease parsing** — genuinely useful where GODSEYE has access to a
-  DHCP server's lease file (e.g. running alongside Pi-hole, or on
-  pfSense/OPNsense), but that access is deployment-specific — most home
-  setups have the router itself as the DHCP server, with no lease file
-  exposed to the Pi at all. This would need to be an opt-in enrichment
-  pointed at a specific file path, not something that works out of the
-  box everywhere the way ARP does.
 - **Nmap-based fingerprinting** (open ports, service banners, OS
   guesses) — real value for device classification, but slow and mildly
   intrusive if run against every device every cycle, and can trip
