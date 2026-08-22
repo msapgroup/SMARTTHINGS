@@ -1,0 +1,26 @@
+name: GODSEYE tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q app
+      - run: python - <<'PY'
+import sys
+sys.path.insert(0, '.')
+from app.diagnostics import ping, dns_lookup, tools_available
+from app.plugins import all_plugins
+assert all_plugins()
+assert isinstance(tools_available(), dict)
+print('GODSEYE smoke tests passed')
+PY
