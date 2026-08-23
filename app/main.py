@@ -1,10 +1,16 @@
+import csv
 import datetime as dt
 import hmac
+import io
+import ipaddress
 import json
 import math
 import os
+import re
 import secrets
+import socket
 import sqlite3
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -97,6 +103,21 @@ def now():
 
 def client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
+
+
+# Hostnames/IPs only: first character alphanumeric (blocks a leading '-',
+# which could otherwise be interpreted as a flag by ping/etc even though
+# subprocess calls here use an argument list, never a shell string), then
+# alnum/dot/colon (IPv6)/hyphen/underscore. This is defense in depth on
+# top of never using shell=True, not a substitute for it.
+_TOOL_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]{0,253}$")
+
+
+def validate_tool_target(raw: str) -> str:
+    target = (raw or "").strip()
+    if not target or not _TOOL_TARGET_RE.match(target):
+        raise HTTPException(400, "Invalid target - use a plain hostname or IP address")
+    return target
 
 
 def audit(c, actor, action, target=None, details="", ip=None):
@@ -361,7 +382,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.14.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.15.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1222,6 +1243,122 @@ def delete_saved_filter(filter_id: int, user=Depends(get_current_user)):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Network tools - ad-hoc ping/DNS lookup from the dashboard. Admin only,
+# since these shell out and consume system resources on demand; input is
+# strictly validated (see validate_tool_target) as defense in depth on top
+# of never using shell=True.
+# ---------------------------------------------------------------------------
+
+class ToolTargetRequest(BaseModel):
+    target: str
+
+
+@app.post(f"{router_prefix}/tools/ping")
+def tool_ping(payload: ToolTargetRequest, request: Request, admin=Depends(require_admin)):
+    target = validate_tool_target(payload.target)
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "4", "-W", "2", target],
+            capture_output=True, text=True, timeout=12,
+        )
+        output = (result.stdout or result.stderr or "").strip()
+        success = result.returncode == 0
+    except subprocess.TimeoutExpired:
+        output, success = "Timed out.", False
+    except FileNotFoundError:
+        raise HTTPException(500, "ping is not installed on this system")
+    with db() as c:
+        audit(c, admin["username"], "tool_ping", target=target, ip=client_ip(request))
+    return {"ok": True, "target": target, "success": success, "output": output[-4000:]}
+
+
+@app.post(f"{router_prefix}/tools/dns-lookup")
+def tool_dns_lookup(payload: ToolTargetRequest, request: Request, admin=Depends(require_admin)):
+    target = validate_tool_target(payload.target)
+    result = {"target": target}
+    try:
+        ipaddress.ip_address(target)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+    try:
+        if is_ip:
+            name, aliases, _ = socket.gethostbyaddr(target)
+            result["hostname"] = name
+            if aliases:
+                result["aliases"] = aliases
+        else:
+            ip = socket.gethostbyname(target)
+            result["ip"] = ip
+    except Exception as exc:
+        result["error"] = str(exc)
+    with db() as c:
+        audit(c, admin["username"], "tool_dns_lookup", target=target, ip=client_ip(request))
+    return {"ok": True, **result}
+
+
+# ---------------------------------------------------------------------------
+# Backup / export - CSV for devices and events (any authenticated user, same
+# visibility as the dashboard views they mirror), CSV for the audit log and
+# the full JSON backup (admin only, matching the Audit Log view's gating).
+# The JSON backup deliberately excludes users, password hashes, sessions,
+# and MFA secrets - a backup file is not the right place for credential
+# material, and restoring it is a manual/documented process, not an
+# import endpoint, to avoid silently overwriting live data.
+# ---------------------------------------------------------------------------
+
+def _csv_response(filename: str, header: list, rows: list) -> Response:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(header)
+    writer.writerows(rows)
+    return Response(
+        content=buf.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get(f"{router_prefix}/export/devices.csv")
+def export_devices_csv(user=Depends(get_current_user)):
+    header = ["mac", "ip", "hostname", "vendor", "name", "device_type", "status", "classification", "first_seen", "last_seen", "notes"]
+    with db() as c:
+        rows = c.execute(f"SELECT {','.join(header)} FROM devices ORDER BY id").fetchall()
+    return _csv_response("godseye-devices.csv", header, [[r[k] for k in header] for r in rows])
+
+
+@app.get(f"{router_prefix}/export/events.csv")
+def export_events_csv(user=Depends(get_current_user)):
+    header = ["created_at", "event_type", "severity", "mac", "ip", "details"]
+    with db() as c:
+        rows = c.execute(f"SELECT {','.join(header)} FROM events ORDER BY id DESC LIMIT 5000").fetchall()
+    return _csv_response("godseye-events.csv", header, [[r[k] for k in header] for r in rows])
+
+
+@app.get(f"{router_prefix}/export/audit.csv")
+def export_audit_csv(admin=Depends(require_admin)):
+    header = ["created_at", "actor", "action", "target", "details", "ip"]
+    with db() as c:
+        rows = c.execute(f"SELECT {','.join(header)} FROM audit_log ORDER BY id DESC LIMIT 5000").fetchall()
+    return _csv_response("godseye-audit.csv", header, [[r[k] for k in header] for r in rows])
+
+
+@app.get(f"{router_prefix}/export/backup.json")
+def export_backup_json(admin=Depends(require_admin)):
+    device_cols = ["mac", "ip", "hostname", "vendor", "name", "device_type", "status", "classification", "first_seen", "last_seen", "notes"]
+    event_cols = ["created_at", "event_type", "severity", "mac", "ip", "details"]
+    rule_cols = ["name", "rule_type", "enabled", "params", "severity"]
+    with db() as c:
+        devices = [dict(r) for r in c.execute(f"SELECT {','.join(device_cols)} FROM devices ORDER BY id")]
+        events = [dict(r) for r in c.execute(f"SELECT {','.join(event_cols)} FROM events ORDER BY id DESC LIMIT 5000")]
+        rules = [dict(r) for r in c.execute(f"SELECT {','.join(rule_cols)} FROM rules ORDER BY id")]
+    payload = {"exported_at": now(), "godseye_version": "0.15", "devices": devices, "events": events, "rules": rules}
+    return Response(
+        content=json.dumps(payload, indent=2), media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=godseye-backup.json"},
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     banner_html = LOGIN_BANNER.replace("<", "&lt;").replace(">", "&gt;") if LOGIN_BANNER else ""
@@ -1291,6 +1428,8 @@ DASHBOARD = r'''<!doctype html>
 <button class="navitem" id="navRules" data-view="rules" onclick="showView('rules')">⚡ <span>Alert Rules</span></button>
 <button class="navitem" id="navUsers" data-view="users" onclick="showView('users')">👤 <span>Users</span></button>
 <button class="navitem" id="navAudit" data-view="audit" onclick="showView('audit')">📜 <span>Audit Log</span></button>
+<button class="navitem" id="navTools" data-view="tools" onclick="showView('tools')">🛠️ <span>Network Tools</span></button>
+<button class="navitem" id="navBackup" data-view="backup" onclick="showView('backup')">💾 <span>Backup</span></button>
 </div>
 <div class="sidebar-footer">
 <button id="scanBtn" class="primary" onclick="scan()">⟳ Scan Now</button>
@@ -1379,6 +1518,38 @@ DASHBOARD = r'''<!doctype html>
 </section>
 </div>
 
+<div class="view" id="view-tools" style="display:none">
+<section class="panel"><h2>Network Tools</h2>
+<div style="padding:16px 18px;display:flex;flex-direction:column;gap:20px;max-width:600px">
+<div>
+<div class="muted" style="margin-bottom:8px">Ping a host</div>
+<div style="display:flex;gap:8px"><input class="input" id="pingTarget" placeholder="e.g. 192.168.1.1 or a hostname"><button class="primary" onclick="runPing()">Ping</button></div>
+<pre id="pingResult" style="background:#0d141f;border:1px solid #2b3a52;border-radius:8px;padding:10px;margin-top:8px;white-space:pre-wrap;font-size:12px;display:none;font-family:monospace"></pre>
+</div>
+<div>
+<div class="muted" style="margin-bottom:8px">DNS lookup</div>
+<div style="display:flex;gap:8px"><input class="input" id="dnsTarget" placeholder="hostname or IP address"><button class="primary" onclick="runDnsLookup()">Lookup</button></div>
+<pre id="dnsResult" style="background:#0d141f;border:1px solid #2b3a52;border-radius:8px;padding:10px;margin-top:8px;white-space:pre-wrap;font-size:12px;display:none;font-family:monospace"></pre>
+</div>
+</div>
+</section>
+</div>
+
+<div class="view" id="view-backup" style="display:none">
+<section class="panel"><h2>Backup &amp; Export</h2>
+<div style="padding:16px 18px;display:flex;flex-direction:column;gap:12px">
+<div class="muted">Downloads use your current login session, so links only work while you're signed in here — they're not shareable URLs.</div>
+<div style="display:flex;gap:10px;flex-wrap:wrap">
+<button class="primary" onclick="downloadExport('devices.csv')">Download Devices CSV</button>
+<button class="primary" onclick="downloadExport('events.csv')">Download Events CSV</button>
+<button class="primary" onclick="downloadExport('audit.csv')">Download Audit Log CSV</button>
+<button class="primary" onclick="downloadExport('backup.json')">Download Full Backup (JSON)</button>
+</div>
+<div class="muted" style="font-size:12px">The full backup includes devices, events, and alert rules. It never includes user accounts, password hashes, sessions, or MFA secrets — restoring credential material from a backup file isn't something this does automatically, on purpose.</div>
+</div>
+</section>
+</div>
+
 </div></main>
 </div>
 </div>
@@ -1416,6 +1587,9 @@ function renderSavedFilters(target){const el=document.getElementById('savedFilte
 function applySavedFilter(target,id){const f=SAVED_FILTERS[target].find(x=>x.id===id);if(!f)return;let def;try{def=JSON.parse(f.definition)}catch(e){return}FILTER_STATE[target]=Object.assign({conditions:[],join:'AND',mode:'include',highlights:[]},def);renderFilterBuilder(target);syncFilterControls(target);applyAndRender(target)}
 async function saveCurrentFilter(target){const name=prompt('Name this filter:');if(!name)return;try{await json('/api/v1/saved-filters',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,target:target,definition:FILTER_STATE[target]})});await loadSavedFilters(target)}catch(e){alert('Could not save filter: '+e.message)}}
 async function deleteSavedFilter(target,id){try{await json('/api/v1/saved-filters/'+id,{method:'DELETE'});await loadSavedFilters(target)}catch(e){}}
+async function runPing(){const target=document.getElementById('pingTarget').value.trim();if(!target)return;const out=document.getElementById('pingResult');out.style.display='block';out.textContent='Running…';try{const r=await json('/api/v1/tools/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:target})});out.textContent=(r.success?'✓ reachable':'✗ unreachable')+'\n\n'+r.output}catch(e){out.textContent='Error: '+e.message}}
+async function runDnsLookup(){const target=document.getElementById('dnsTarget').value.trim();if(!target)return;const out=document.getElementById('dnsResult');out.style.display='block';out.textContent='Looking up…';try{const r=await json('/api/v1/tools/dns-lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:target})});out.textContent=JSON.stringify(r,null,2)}catch(e){out.textContent='Error: '+e.message}}
+function downloadExport(name){window.location='/api/v1/export/'+name}
 
 let ME=null;
 let PENDING_MFA_TOKEN=null;
@@ -1448,6 +1622,6 @@ async function removeUser(id,username){if(!confirm('Remove user "'+username+'"?'
 async function load(){let h=await json('/api/v1/health');total.textContent=h.total;online.textContent=h.online;unknown.textContent=h.needs_review;eventsCount.textContent=h.events;updated.textContent='Last refreshed '+new Date().toLocaleTimeString();lastScan.textContent=h.scanner.detail;const hb=document.getElementById('healthbar');if(!h.scanner.healthy){hb.className='healthbar bad';hb.textContent='⚠ Scanner unhealthy — '+h.scanner.detail;hb.style.display='block'}else{hb.style.display='none'}await loadDevices();ALL_EVENTS=await json('/api/v1/events?limit=300');renderEvents()}
 async function cycleClass(id,current){await json('/api/v1/devices/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({classification:CLASS_CYCLE[current]||'new'})});load()}
 async function scan(){await json('/api/v1/scan',{method:'POST'});updated.textContent='Scan requested…';setTimeout(load,3000)}
-async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';['navRules','navUsers','navAudit'].forEach(id=>{document.getElementById(id).style.display=ME.role==='admin'?'':'none'});const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}renderFilterBuilder('events');syncFilterControls('events');renderFilterBuilder('audit');syncFilterControls('audit');showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();await loadSavedFilters('events');if(ME.role==='admin')await loadSavedFilters('audit');setInterval(load,10000)}
+async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';['navRules','navUsers','navAudit','navTools','navBackup'].forEach(id=>{document.getElementById(id).style.display=ME.role==='admin'?'':'none'});const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}renderFilterBuilder('events');syncFilterControls('events');renderFilterBuilder('audit');syncFilterControls('audit');showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();await loadSavedFilters('events');if(ME.role==='admin')await loadSavedFilters('audit');setInterval(load,10000)}
 boot();
 </script></body></html>'''

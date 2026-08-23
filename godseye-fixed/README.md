@@ -2,8 +2,10 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.14
+## Current release: 0.15
 
+- Network Tools sidebar section — ad-hoc ping and DNS lookup, admin only, strict input validation against injection
+- Backup & Export sidebar section — CSV export of devices/events, admin-only CSV audit export and full JSON backup (never includes credentials)
 - Opt-in DHCP lease file parsing (dnsmasq format) for hostname enrichment — takes priority over reverse DNS when both are available
 - Optional Prometheus-compatible `/metrics` endpoint (device/event/user/rule counts, scanner health) — off by default, requires a bearer token to enable
 - EventLogExpert-inspired filtering on the Activity and Audit Log views — AND/OR conditions, include/exclude mode, color highlight rules, and a personal saved Filter Library per user
@@ -47,6 +49,10 @@
 <p>
   <img src="docs/screenshots/activity-filters.png" width="700" alt="Activity view with EventLogExpert-style filtering and highlight rules"><br>
   <em>Activity - AND/OR condition filtering, include/exclude mode, and color highlight rules (EventLogExpert-inspired)</em>
+</p>
+<p>
+  <img src="docs/screenshots/network-tools.png" width="700" alt="Network Tools view with ping and DNS lookup"><br>
+  <em>Network Tools - ad-hoc ping and DNS lookup from the dashboard</em>
 </p>
 <p>
   <img src="docs/screenshots/mfa-setup.png" width="700" alt="Two-factor authentication setup"><br>
@@ -265,6 +271,25 @@ deployment; this isn't built for querying years of history):
   account — each user has their own library, stored server-side so it
   follows you across devices rather than being stuck in one browser's
   local storage.
+
+## Network Tools & Backup
+
+Two more admin-only sidebar sections as of 0.15:
+
+- **Network Tools** — ad-hoc ping and DNS lookup against any host, run
+  directly from the dashboard instead of needing shell access to the Pi.
+  Input is strictly validated (plain hostname/IP characters only, no
+  leading `-`) before being passed to the system `ping` command as an
+  argument list — never through a shell — as defense against argument or
+  command injection.
+- **Backup & Export** — download devices and events as CSV (any
+  authenticated user, matching what they can already see in the UI), or
+  the audit log and a full JSON backup (admin only, matching the Audit
+  Log view's own gating). The JSON backup deliberately **excludes user
+  accounts, password hashes, sessions, and MFA secrets** — a backup file
+  isn't the right place for credential material, and there's no
+  corresponding "restore" endpoint that would silently overwrite live
+  data from an uploaded file.
 
 ## Metrics
 
