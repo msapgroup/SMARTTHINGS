@@ -382,7 +382,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.15.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.17.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -871,6 +871,87 @@ def audit_log(limit: int = 200, admin=Depends(require_admin)):
     limit = min(max(limit, 1), 1000)
     with db() as c:
         return [dict(r) for r in c.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,))]
+
+
+# ---------------------------------------------------------------------------
+# Login security - an original, GODSEYE-native analysis of its own login
+# audit trail (never Windows Event Logs / AD - that's a different data
+# domain entirely). Surfaces brute-force-shaped patterns (many failed
+# attempts from one source, one source trying multiple usernames) and a
+# simple source-IP-to-username relationship graph, similar in spirit to
+# graph-based logon analysis tools but built from scratch against
+# audit_log with plain SQL aggregation and hand-drawn SVG - no graph
+# database, no new dependency.
+# ---------------------------------------------------------------------------
+
+LOGIN_SECURITY_SUSPICIOUS_THRESHOLD = int(os.environ.get("GODSEYE_LOGIN_SECURITY_THRESHOLD", "3"))
+
+
+@app.get(f"{router_prefix}/login-security")
+def login_security(hours: int = 24, admin=Depends(require_admin)):
+    hours = min(max(hours, 1), 24 * 30)
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).isoformat()
+    with db() as c:
+        success_count = c.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE action='login_success' AND created_at>=?", (since,)
+        ).fetchone()[0]
+        failed_count = c.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE action='login_failed' AND created_at>=?", (since,)
+        ).fetchone()[0]
+        locked_events = c.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE action='account_locked' AND created_at>=?", (since,)
+        ).fetchone()[0]
+        currently_locked = c.execute(
+            "SELECT username FROM users WHERE locked_until IS NOT NULL AND locked_until > ?", (now(),)
+        ).fetchall()
+        failed_pairs = c.execute(
+            "SELECT actor, ip, COUNT(*) c, MIN(created_at) first_seen, MAX(created_at) last_seen "
+            "FROM audit_log WHERE action='login_failed' AND created_at>=? AND ip IS NOT NULL "
+            "GROUP BY actor, ip ORDER BY c DESC",
+            (since,),
+        ).fetchall()
+
+    edges = [
+        {"ip": r["ip"], "actor": r["actor"], "count": r["c"], "first_seen": r["first_seen"], "last_seen": r["last_seen"]}
+        for r in failed_pairs
+    ]
+
+    by_ip = {}
+    for e in edges:
+        agg = by_ip.setdefault(e["ip"], {"usernames": set(), "total_failed": 0, "first_seen": e["first_seen"], "last_seen": e["last_seen"]})
+        agg["usernames"].add(e["actor"])
+        agg["total_failed"] += e["count"]
+        agg["first_seen"] = min(agg["first_seen"], e["first_seen"])
+        agg["last_seen"] = max(agg["last_seen"], e["last_seen"])
+
+    suspicious = []
+    for ip, agg in by_ip.items():
+        # Two independent brute-force-shaped signals: enough raw failed
+        # attempts from one source, or one source trying more than one
+        # username (credential stuffing / username enumeration shape).
+        is_suspicious = agg["total_failed"] >= LOGIN_SECURITY_SUSPICIOUS_THRESHOLD or len(agg["usernames"]) > 1
+        suspicious.append({
+            "ip": ip,
+            "usernames": sorted(agg["usernames"]),
+            "total_failed": agg["total_failed"],
+            "first_seen": agg["first_seen"],
+            "last_seen": agg["last_seen"],
+            "suspicious": is_suspicious,
+        })
+    suspicious.sort(key=lambda x: -x["total_failed"])
+
+    return {
+        "window_hours": hours,
+        "threshold": LOGIN_SECURITY_SUSPICIOUS_THRESHOLD,
+        "summary": {
+            "success": success_count,
+            "failed": failed_count,
+            "locked_events": locked_events,
+            "currently_locked": [r["username"] for r in currently_locked],
+        },
+        "edges": edges,
+        "by_ip": suspicious,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1415,6 +1496,30 @@ DASHBOARD = r'''<!doctype html>
     </form>
   </div>
 </div>
+<div id="deviceEditOverlay" class="overlay" style="display:none">
+  <div class="authcard" style="max-width:440px">
+    <h2>Edit Device</h2>
+    <div class="muted" id="deviceEditMac" style="margin-bottom:14px"></div>
+    <form onsubmit="return saveDeviceEdit(event)">
+      <input class="input" id="deviceEditName" placeholder="Device name (e.g. Living Room TV)">
+      <input class="input" id="deviceEditType" placeholder="Device type (e.g. IoT, Computer, Printer)" style="margin-top:10px">
+      <select class="filter" id="deviceEditClass" style="margin-top:10px;width:100%">
+        <option value="new">New</option>
+        <option value="known">Known</option>
+        <option value="investigate">Investigate</option>
+        <option value="ignored">Ignored</option>
+      </select>
+      <textarea class="input" id="deviceEditNotes" placeholder="Notes" rows="3" style="margin-top:10px;width:100%;resize:vertical;font-family:inherit"></textarea>
+      <div class="err" id="deviceEditErr"></div>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button class="primary" type="submit" style="flex:1">Save</button>
+        <button class="link" type="button" onclick="closeDeviceEdit()">Cancel</button>
+      </div>
+    </form>
+    <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:18px;padding-top:14px;border-top:1px solid #1d2838">Recent activity for this device</div>
+    <div id="deviceEditHistory" style="margin-top:8px;max-height:180px;overflow:auto;font-size:12px"></div>
+  </div>
+</div>
 <div id="app" style="display:none">
 <div class="healthbar" id="healthbar"></div>
 <div class="healthbar" id="pwReminderBar" style="display:none;color:#f7c948;cursor:pointer" onclick="openChangePassword()"></div>
@@ -1430,6 +1535,7 @@ DASHBOARD = r'''<!doctype html>
 <button class="navitem" id="navAudit" data-view="audit" onclick="showView('audit')">📜 <span>Audit Log</span></button>
 <button class="navitem" id="navTools" data-view="tools" onclick="showView('tools')">🛠️ <span>Network Tools</span></button>
 <button class="navitem" id="navBackup" data-view="backup" onclick="showView('backup')">💾 <span>Backup</span></button>
+<button class="navitem" id="navLoginSec" data-view="loginsec" onclick="showView('loginsec')">🕵️ <span>Login Security</span></button>
 </div>
 <div class="sidebar-footer">
 <button id="scanBtn" class="primary" onclick="scan()">⟳ Scan Now</button>
@@ -1444,7 +1550,7 @@ DASHBOARD = r'''<!doctype html>
 <div class="hero"><div><h1>Network Overview</h1><div class="muted" id="updated">Loading telemetry…</div></div></div>
 <div class="cards"><div class="card"><div class="label">Known Devices</div><div class="num" id="total">—</div></div><div class="card"><div class="label">Online</div><div class="num green" id="online">—</div></div><div class="card"><div class="label">Needs Review</div><div class="num yellow" id="unknown">—</div></div><div class="card"><div class="label">Events</div><div class="num" id="eventsCount">—</div></div><div class="card"><div class="label">Last Scan</div><div class="num" id="lastScan" style="font-size:16px">—</div></div></div>
 <div class="toolbar"><input id="search" class="input" placeholder="Search name, IP, MAC, hostname or vendor…" oninput="loadDevices()"><select id="status" class="filter" onchange="loadDevices()"><option value="">All statuses</option><option value="online">Online</option><option value="suspected_offline">Suspected offline</option><option value="offline">Offline</option></select><select id="classification" class="filter" onchange="loadDevices()"><option value="">All classifications</option><option value="new">New</option><option value="known">Known</option><option value="investigate">Investigate</option><option value="ignored">Ignored</option></select></div>
-<section class="panel"><h2>Devices</h2><div style="overflow:auto"><table><thead><tr><th>Status</th><th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th><th>Classification</th></tr></thead><tbody id="devices"></tbody></table></div></section>
+<section class="panel"><h2>Devices</h2><div style="overflow:auto"><table><thead><tr><th>Status</th><th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th><th>Classification</th><th></th></tr></thead><tbody id="devices"></tbody></table></div></section>
 </div>
 
 <div class="view" id="view-activity" style="display:none">
@@ -1550,6 +1656,23 @@ DASHBOARD = r'''<!doctype html>
 </section>
 </div>
 
+<div class="view" id="view-loginsec" style="display:none">
+<div class="cards">
+<div class="card"><div class="label">Failed Logins (24h)</div><div class="num yellow" id="lsFailed">—</div></div>
+<div class="card"><div class="label">Successful Logins (24h)</div><div class="num green" id="lsSuccess">—</div></div>
+<div class="card"><div class="label">Currently Locked</div><div class="num" id="lsLocked">—</div></div>
+<div class="card"><div class="label">Suspicious Sources</div><div class="num" id="lsSuspicious">—</div></div>
+</div>
+<section class="panel" style="margin-top:14px"><h2>Source &rarr; Account Relationships</h2>
+<div class="muted" style="padding:12px 18px 0;font-size:12px">Each line is a source IP that had at least one failed login against the account it points to, in the last 24 hours. Thicker/redder lines mean more failed attempts.</div>
+<div style="padding:10px 18px;overflow:auto"><svg id="loginGraphSvg" width="100%" style="min-width:520px"></svg></div>
+</section>
+<section class="panel" style="margin-top:14px"><h2>Suspicious Sources</h2>
+<div class="muted" style="padding:12px 18px 0;font-size:12px" id="lsThresholdNote"></div>
+<div style="overflow:auto"><table><thead><tr><th>Source IP</th><th>Usernames tried</th><th>Failed attempts</th><th>First seen</th><th>Last seen</th><th>Flagged</th></tr></thead><tbody id="loginSecTable"></tbody></table></div>
+</section>
+</div>
+
 </div></main>
 </div>
 </div>
@@ -1590,8 +1713,27 @@ async function deleteSavedFilter(target,id){try{await json('/api/v1/saved-filter
 async function runPing(){const target=document.getElementById('pingTarget').value.trim();if(!target)return;const out=document.getElementById('pingResult');out.style.display='block';out.textContent='Running…';try{const r=await json('/api/v1/tools/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:target})});out.textContent=(r.success?'✓ reachable':'✗ unreachable')+'\n\n'+r.output}catch(e){out.textContent='Error: '+e.message}}
 async function runDnsLookup(){const target=document.getElementById('dnsTarget').value.trim();if(!target)return;const out=document.getElementById('dnsResult');out.style.display='block';out.textContent='Looking up…';try{const r=await json('/api/v1/tools/dns-lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:target})});out.textContent=JSON.stringify(r,null,2)}catch(e){out.textContent='Error: '+e.message}}
 function downloadExport(name){window.location='/api/v1/export/'+name}
+async function loadLoginSecurity(){if(!ME||ME.role!=='admin'){return}let data;try{data=await json('/api/v1/login-security?hours=24')}catch(e){return}
+document.getElementById('lsFailed').textContent=data.summary.failed;
+document.getElementById('lsSuccess').textContent=data.summary.success;
+document.getElementById('lsLocked').textContent=data.summary.currently_locked.length;
+document.getElementById('lsSuspicious').textContent=data.by_ip.filter(x=>x.suspicious).length;
+document.getElementById('lsThresholdNote').textContent='A source is flagged when it has '+data.threshold+'+ failed attempts against one account, or tries more than one username (configurable via GODSEYE_LOGIN_SECURITY_THRESHOLD).';
+const tbody=document.getElementById('loginSecTable');
+tbody.innerHTML=data.by_ip.length?data.by_ip.map(x=>`<tr${x.suspicious?' style="background:#3a1522"':''}><td>${esc(x.ip)}</td><td>${x.usernames.map(esc).join(', ')}</td><td>${x.total_failed}</td><td>${esc(new Date(x.first_seen).toLocaleString())}</td><td>${esc(new Date(x.last_seen).toLocaleString())}</td><td>${x.suspicious?'⚠ Yes':'No'}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">No failed login attempts in the last 24 hours.</td></tr>';
+renderLoginGraph(data.edges)}
+function renderLoginGraph(edges){const svgEl=document.getElementById('loginGraphSvg');if(!edges.length){svgEl.innerHTML='<text x="10" y="24" fill="#72819a" font-size="13">No failed login attempts to visualize in this window.</text>';svgEl.setAttribute('height','40');return}
+const ips=[...new Set(edges.map(e=>e.ip))];const users=[...new Set(edges.map(e=>e.actor))];
+const rowH=32,leftX=110,rightX=380,topY=24;const maxCount=Math.max(...edges.map(e=>e.count));
+let svg='';
+edges.forEach(e=>{const y1=topY+ips.indexOf(e.ip)*rowH;const y2=topY+users.indexOf(e.actor)*rowH;const w=1+(e.count/maxCount)*4;const op=0.35+0.45*(e.count/maxCount);svg+=`<line x1="${leftX}" y1="${y1}" x2="${rightX}" y2="${y2}" stroke="#ff8194" stroke-width="${w}" opacity="${op.toFixed(2)}"/>`});
+ips.forEach((ip,i)=>{const y=topY+i*rowH;svg+=`<circle cx="${leftX}" cy="${y}" r="5" fill="#ff8194"/><text x="${leftX-10}" y="${y+4}" text-anchor="end" fill="#dbe7f7" font-size="12">${esc(ip)}</text>`});
+users.forEach((u,i)=>{const y=topY+i*rowH;svg+=`<circle cx="${rightX}" cy="${y}" r="5" fill="#7f9fd8"/><text x="${rightX+10}" y="${y+4}" fill="#dbe7f7" font-size="12">${esc(u)}</text>`});
+const height=Math.max(ips.length,users.length)*rowH+30;
+svgEl.setAttribute('viewBox',`0 0 560 ${height}`);svgEl.setAttribute('height',height);svgEl.innerHTML=svg}
 
 let ME=null;
+let EDITING_DEVICE_ID=null;
 let PENDING_MFA_TOKEN=null;
 function getCookie(name){const m=document.cookie.match('(?:^|; )'+name+'=([^;]*)');return m?decodeURIComponent(m[1]):null}
 async function json(url,opt={}){opt.headers=opt.headers||{};if(opt.method&&opt.method!=='GET'){opt.headers['X-CSRF-Token']=getCookie('godseye_csrf')||''}let r=await fetch(url,opt);if(r.status===401){showLogin();throw new Error('unauthenticated')}if(!r.ok){let t=await r.text();throw new Error(t)}return r.status===204?null:r.json()}
@@ -1603,7 +1745,8 @@ async function doMfaVerify(e){e.preventDefault();const err=document.getElementBy
 function openChangePassword(){document.getElementById('pwOverlay').style.display='grid'}
 async function doChangePassword(e){e.preventDefault();const err=document.getElementById('pwErr');err.textContent='';try{await json('/api/v1/auth/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:curPass.value,new_password:newPass.value})});await boot()}catch(e){err.textContent='Could not change password — check your current password'}return false}
 async function logout(){await fetch('/api/v1/auth/logout',{method:'POST',headers:{'X-CSRF-Token':getCookie('godseye_csrf')||''}});showLogin()}
-async function loadDevices(){let q=new URLSearchParams();if(search.value)q.set('search',search.value);if(status.value)q.set('status',status.value);if(classification.value)q.set('classification',classification.value);let d=await json('/api/v1/devices?'+q);const canEdit=ME&&ME.role==='admin';devices.innerHTML=d.length?d.map(x=>`<tr><td class="${esc(x.status)}"><span class="dot">●</span> ${esc(x.status).replace('_',' ')}</td><td><div class="name">${esc(x.name||x.hostname||'Unknown device')}</div><div class="muted">${esc(x.device_type||'Unclassified')}</div></td><td>${esc(x.ip)}</td><td>${esc(x.mac)}</td><td>${esc(x.vendor||'—')}</td><td><button class="pill ${esc(x.classification)}" ${canEdit?`onclick="cycleClass(${x.id},'${x.classification}')"`:'disabled'}>${CLASS_LABEL[x.classification]||x.classification}</button></td></tr>`).join(''):'<tr><td colspan="6" class="empty">No devices match this filter.</td></tr>'}
+let CURRENT_DEVICES=[];
+async function loadDevices(){let q=new URLSearchParams();if(search.value)q.set('search',search.value);if(status.value)q.set('status',status.value);if(classification.value)q.set('classification',classification.value);let d=await json('/api/v1/devices?'+q);CURRENT_DEVICES=d;const canEdit=ME&&ME.role==='admin';devices.innerHTML=d.length?d.map(x=>`<tr><td class="${esc(x.status)}"><span class="dot">●</span> ${esc(x.status).replace('_',' ')}</td><td><div class="name">${esc(x.name||x.hostname||'Unknown device')}</div><div class="muted">${esc(x.device_type||'Unclassified')}</div></td><td>${esc(x.ip)}</td><td>${esc(x.mac)}</td><td>${esc(x.vendor||'—')}</td><td><button class="pill ${esc(x.classification)}" ${canEdit?`onclick="cycleClass(${x.id},'${x.classification}')"`:'disabled'}>${CLASS_LABEL[x.classification]||x.classification}</button></td><td>${canEdit?`<button class="link" onclick="openDeviceEditById(${x.id})">Edit</button>`:''}</td></tr>`).join(''):'<tr><td colspan="7" class="empty">No devices match this filter.</td></tr>'}
 async function loadUsers(){if(!ME||ME.role!=='admin'){usersPanel.style.display='none';return}usersPanel.style.display='block';let u=await json('/api/v1/users');users.innerHTML=u.map(x=>{let mustChange=x.must_change_password?(x.must_change_password_by?`yes, by ${esc(new Date(x.must_change_password_by).toLocaleDateString())}`:'yes'):'no';return `<tr><td>${esc(x.username)}</td><td><span class="pill ${esc(x.role)}">${esc(x.role)}</span></td><td>${esc(new Date(x.created_at).toLocaleDateString())}</td><td>${x.last_login_at?esc(new Date(x.last_login_at).toLocaleString()):'never'}</td><td>${x.password_changed_at?esc(new Date(x.password_changed_at).toLocaleDateString()):'—'}</td><td>${mustChange}</td><td>${x.mfa_enabled?'yes':'no'}</td><td>${x.username===ME.username?'':`<button class="link" onclick="removeUser(${x.id},'${esc(x.username)}')">Remove</button>${x.mfa_enabled?` <button class="link" onclick="resetUserMfa(${x.id},'${esc(x.username)}')">Reset MFA</button>`:''}`}</td></tr>`}).join('')}
 async function loadAudit(){if(!ME||ME.role!=='admin'){auditPanel.style.display='none';return}auditPanel.style.display='block';ALL_AUDIT=await json('/api/v1/audit?limit=300');renderAudit()}
 async function loadSecurity(){const el=document.getElementById('mfaStatus');if(ME.mfa_enabled){el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#50e3a4">enabled</b> on this account.</div><button class="link" style="margin-top:10px" onclick="startMfaDisable()">Disable MFA</button>`}else{el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#f7c948">not enabled</b>. Add it for a second layer of protection beyond your password.</div><button class="primary" style="margin-top:10px" onclick="startMfaSetup()">Set up MFA</button>`}}
@@ -1621,7 +1764,11 @@ async function createUser(e){e.preventDefault();try{await json('/api/v1/users',{
 async function removeUser(id,username){if(!confirm('Remove user "'+username+'"?'))return;await json('/api/v1/users/'+id,{method:'DELETE'});await loadUsers()}
 async function load(){let h=await json('/api/v1/health');total.textContent=h.total;online.textContent=h.online;unknown.textContent=h.needs_review;eventsCount.textContent=h.events;updated.textContent='Last refreshed '+new Date().toLocaleTimeString();lastScan.textContent=h.scanner.detail;const hb=document.getElementById('healthbar');if(!h.scanner.healthy){hb.className='healthbar bad';hb.textContent='⚠ Scanner unhealthy — '+h.scanner.detail;hb.style.display='block'}else{hb.style.display='none'}await loadDevices();ALL_EVENTS=await json('/api/v1/events?limit=300');renderEvents()}
 async function cycleClass(id,current){await json('/api/v1/devices/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({classification:CLASS_CYCLE[current]||'new'})});load()}
+function openDeviceEditById(id){const d=CURRENT_DEVICES.find(x=>x.id===id);if(d)openDeviceEdit(d)}
+async function openDeviceEdit(d){EDITING_DEVICE_ID=d.id;document.getElementById('deviceEditMac').textContent=d.mac+(d.ip?' · '+d.ip:'');document.getElementById('deviceEditName').value=d.name||'';document.getElementById('deviceEditType').value=d.device_type||'';document.getElementById('deviceEditClass').value=d.classification;document.getElementById('deviceEditNotes').value=d.notes||'';document.getElementById('deviceEditErr').textContent='';const hist=document.getElementById('deviceEditHistory');hist.innerHTML='<span class="muted">Loading…</span>';document.getElementById('deviceEditOverlay').style.display='grid';try{const events=await json('/api/v1/devices/'+d.id+'/events?limit=15');hist.innerHTML=events.length?events.map(e=>`<div style="padding:5px 0;border-bottom:1px solid #182335"><span class="muted">${esc(new Date(e.created_at).toLocaleString())}</span> — <span class="pill">${esc(e.event_type)}</span> ${esc(e.details||'')}</div>`).join(''):'<span class="muted">No recorded activity for this device yet.</span>'}catch(e){hist.innerHTML='<span class="muted">Could not load history.</span>'}}
+function closeDeviceEdit(){document.getElementById('deviceEditOverlay').style.display='none';EDITING_DEVICE_ID=null}
+async function saveDeviceEdit(e){e.preventDefault();if(!EDITING_DEVICE_ID)return false;const err=document.getElementById('deviceEditErr');err.textContent='';try{await json('/api/v1/devices/'+EDITING_DEVICE_ID,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('deviceEditName').value.trim(),device_type:document.getElementById('deviceEditType').value.trim(),classification:document.getElementById('deviceEditClass').value,notes:document.getElementById('deviceEditNotes').value})});closeDeviceEdit();await loadDevices()}catch(ex){err.textContent='Could not save changes — try again'}return false}
 async function scan(){await json('/api/v1/scan',{method:'POST'});updated.textContent='Scan requested…';setTimeout(load,3000)}
-async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';['navRules','navUsers','navAudit','navTools','navBackup'].forEach(id=>{document.getElementById(id).style.display=ME.role==='admin'?'':'none'});const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}renderFilterBuilder('events');syncFilterControls('events');renderFilterBuilder('audit');syncFilterControls('audit');showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();await loadSavedFilters('events');if(ME.role==='admin')await loadSavedFilters('audit');setInterval(load,10000)}
+async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';['navRules','navUsers','navAudit','navTools','navBackup','navLoginSec'].forEach(id=>{document.getElementById(id).style.display=ME.role==='admin'?'':'none'});const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}renderFilterBuilder('events');syncFilterControls('events');renderFilterBuilder('audit');syncFilterControls('audit');showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();await loadSavedFilters('events');if(ME.role==='admin'){await loadSavedFilters('audit');await loadLoginSecurity()}setInterval(load,10000)}
 boot();
 </script></body></html>'''
