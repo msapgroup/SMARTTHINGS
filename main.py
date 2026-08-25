@@ -382,7 +382,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.16.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.17.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1496,6 +1496,30 @@ DASHBOARD = r'''<!doctype html>
     </form>
   </div>
 </div>
+<div id="deviceEditOverlay" class="overlay" style="display:none">
+  <div class="authcard" style="max-width:440px">
+    <h2>Edit Device</h2>
+    <div class="muted" id="deviceEditMac" style="margin-bottom:14px"></div>
+    <form onsubmit="return saveDeviceEdit(event)">
+      <input class="input" id="deviceEditName" placeholder="Device name (e.g. Living Room TV)">
+      <input class="input" id="deviceEditType" placeholder="Device type (e.g. IoT, Computer, Printer)" style="margin-top:10px">
+      <select class="filter" id="deviceEditClass" style="margin-top:10px;width:100%">
+        <option value="new">New</option>
+        <option value="known">Known</option>
+        <option value="investigate">Investigate</option>
+        <option value="ignored">Ignored</option>
+      </select>
+      <textarea class="input" id="deviceEditNotes" placeholder="Notes" rows="3" style="margin-top:10px;width:100%;resize:vertical;font-family:inherit"></textarea>
+      <div class="err" id="deviceEditErr"></div>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button class="primary" type="submit" style="flex:1">Save</button>
+        <button class="link" type="button" onclick="closeDeviceEdit()">Cancel</button>
+      </div>
+    </form>
+    <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:18px;padding-top:14px;border-top:1px solid #1d2838">Recent activity for this device</div>
+    <div id="deviceEditHistory" style="margin-top:8px;max-height:180px;overflow:auto;font-size:12px"></div>
+  </div>
+</div>
 <div id="app" style="display:none">
 <div class="healthbar" id="healthbar"></div>
 <div class="healthbar" id="pwReminderBar" style="display:none;color:#f7c948;cursor:pointer" onclick="openChangePassword()"></div>
@@ -1526,7 +1550,7 @@ DASHBOARD = r'''<!doctype html>
 <div class="hero"><div><h1>Network Overview</h1><div class="muted" id="updated">Loading telemetry…</div></div></div>
 <div class="cards"><div class="card"><div class="label">Known Devices</div><div class="num" id="total">—</div></div><div class="card"><div class="label">Online</div><div class="num green" id="online">—</div></div><div class="card"><div class="label">Needs Review</div><div class="num yellow" id="unknown">—</div></div><div class="card"><div class="label">Events</div><div class="num" id="eventsCount">—</div></div><div class="card"><div class="label">Last Scan</div><div class="num" id="lastScan" style="font-size:16px">—</div></div></div>
 <div class="toolbar"><input id="search" class="input" placeholder="Search name, IP, MAC, hostname or vendor…" oninput="loadDevices()"><select id="status" class="filter" onchange="loadDevices()"><option value="">All statuses</option><option value="online">Online</option><option value="suspected_offline">Suspected offline</option><option value="offline">Offline</option></select><select id="classification" class="filter" onchange="loadDevices()"><option value="">All classifications</option><option value="new">New</option><option value="known">Known</option><option value="investigate">Investigate</option><option value="ignored">Ignored</option></select></div>
-<section class="panel"><h2>Devices</h2><div style="overflow:auto"><table><thead><tr><th>Status</th><th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th><th>Classification</th></tr></thead><tbody id="devices"></tbody></table></div></section>
+<section class="panel"><h2>Devices</h2><div style="overflow:auto"><table><thead><tr><th>Status</th><th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th><th>Classification</th><th></th></tr></thead><tbody id="devices"></tbody></table></div></section>
 </div>
 
 <div class="view" id="view-activity" style="display:none">
@@ -1709,6 +1733,7 @@ const height=Math.max(ips.length,users.length)*rowH+30;
 svgEl.setAttribute('viewBox',`0 0 560 ${height}`);svgEl.setAttribute('height',height);svgEl.innerHTML=svg}
 
 let ME=null;
+let EDITING_DEVICE_ID=null;
 let PENDING_MFA_TOKEN=null;
 function getCookie(name){const m=document.cookie.match('(?:^|; )'+name+'=([^;]*)');return m?decodeURIComponent(m[1]):null}
 async function json(url,opt={}){opt.headers=opt.headers||{};if(opt.method&&opt.method!=='GET'){opt.headers['X-CSRF-Token']=getCookie('godseye_csrf')||''}let r=await fetch(url,opt);if(r.status===401){showLogin();throw new Error('unauthenticated')}if(!r.ok){let t=await r.text();throw new Error(t)}return r.status===204?null:r.json()}
@@ -1720,7 +1745,8 @@ async function doMfaVerify(e){e.preventDefault();const err=document.getElementBy
 function openChangePassword(){document.getElementById('pwOverlay').style.display='grid'}
 async function doChangePassword(e){e.preventDefault();const err=document.getElementById('pwErr');err.textContent='';try{await json('/api/v1/auth/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:curPass.value,new_password:newPass.value})});await boot()}catch(e){err.textContent='Could not change password — check your current password'}return false}
 async function logout(){await fetch('/api/v1/auth/logout',{method:'POST',headers:{'X-CSRF-Token':getCookie('godseye_csrf')||''}});showLogin()}
-async function loadDevices(){let q=new URLSearchParams();if(search.value)q.set('search',search.value);if(status.value)q.set('status',status.value);if(classification.value)q.set('classification',classification.value);let d=await json('/api/v1/devices?'+q);const canEdit=ME&&ME.role==='admin';devices.innerHTML=d.length?d.map(x=>`<tr><td class="${esc(x.status)}"><span class="dot">●</span> ${esc(x.status).replace('_',' ')}</td><td><div class="name">${esc(x.name||x.hostname||'Unknown device')}</div><div class="muted">${esc(x.device_type||'Unclassified')}</div></td><td>${esc(x.ip)}</td><td>${esc(x.mac)}</td><td>${esc(x.vendor||'—')}</td><td><button class="pill ${esc(x.classification)}" ${canEdit?`onclick="cycleClass(${x.id},'${x.classification}')"`:'disabled'}>${CLASS_LABEL[x.classification]||x.classification}</button></td></tr>`).join(''):'<tr><td colspan="6" class="empty">No devices match this filter.</td></tr>'}
+let CURRENT_DEVICES=[];
+async function loadDevices(){let q=new URLSearchParams();if(search.value)q.set('search',search.value);if(status.value)q.set('status',status.value);if(classification.value)q.set('classification',classification.value);let d=await json('/api/v1/devices?'+q);CURRENT_DEVICES=d;const canEdit=ME&&ME.role==='admin';devices.innerHTML=d.length?d.map(x=>`<tr><td class="${esc(x.status)}"><span class="dot">●</span> ${esc(x.status).replace('_',' ')}</td><td><div class="name">${esc(x.name||x.hostname||'Unknown device')}</div><div class="muted">${esc(x.device_type||'Unclassified')}</div></td><td>${esc(x.ip)}</td><td>${esc(x.mac)}</td><td>${esc(x.vendor||'—')}</td><td><button class="pill ${esc(x.classification)}" ${canEdit?`onclick="cycleClass(${x.id},'${x.classification}')"`:'disabled'}>${CLASS_LABEL[x.classification]||x.classification}</button></td><td>${canEdit?`<button class="link" onclick="openDeviceEditById(${x.id})">Edit</button>`:''}</td></tr>`).join(''):'<tr><td colspan="7" class="empty">No devices match this filter.</td></tr>'}
 async function loadUsers(){if(!ME||ME.role!=='admin'){usersPanel.style.display='none';return}usersPanel.style.display='block';let u=await json('/api/v1/users');users.innerHTML=u.map(x=>{let mustChange=x.must_change_password?(x.must_change_password_by?`yes, by ${esc(new Date(x.must_change_password_by).toLocaleDateString())}`:'yes'):'no';return `<tr><td>${esc(x.username)}</td><td><span class="pill ${esc(x.role)}">${esc(x.role)}</span></td><td>${esc(new Date(x.created_at).toLocaleDateString())}</td><td>${x.last_login_at?esc(new Date(x.last_login_at).toLocaleString()):'never'}</td><td>${x.password_changed_at?esc(new Date(x.password_changed_at).toLocaleDateString()):'—'}</td><td>${mustChange}</td><td>${x.mfa_enabled?'yes':'no'}</td><td>${x.username===ME.username?'':`<button class="link" onclick="removeUser(${x.id},'${esc(x.username)}')">Remove</button>${x.mfa_enabled?` <button class="link" onclick="resetUserMfa(${x.id},'${esc(x.username)}')">Reset MFA</button>`:''}`}</td></tr>`}).join('')}
 async function loadAudit(){if(!ME||ME.role!=='admin'){auditPanel.style.display='none';return}auditPanel.style.display='block';ALL_AUDIT=await json('/api/v1/audit?limit=300');renderAudit()}
 async function loadSecurity(){const el=document.getElementById('mfaStatus');if(ME.mfa_enabled){el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#50e3a4">enabled</b> on this account.</div><button class="link" style="margin-top:10px" onclick="startMfaDisable()">Disable MFA</button>`}else{el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#f7c948">not enabled</b>. Add it for a second layer of protection beyond your password.</div><button class="primary" style="margin-top:10px" onclick="startMfaSetup()">Set up MFA</button>`}}
@@ -1738,6 +1764,10 @@ async function createUser(e){e.preventDefault();try{await json('/api/v1/users',{
 async function removeUser(id,username){if(!confirm('Remove user "'+username+'"?'))return;await json('/api/v1/users/'+id,{method:'DELETE'});await loadUsers()}
 async function load(){let h=await json('/api/v1/health');total.textContent=h.total;online.textContent=h.online;unknown.textContent=h.needs_review;eventsCount.textContent=h.events;updated.textContent='Last refreshed '+new Date().toLocaleTimeString();lastScan.textContent=h.scanner.detail;const hb=document.getElementById('healthbar');if(!h.scanner.healthy){hb.className='healthbar bad';hb.textContent='⚠ Scanner unhealthy — '+h.scanner.detail;hb.style.display='block'}else{hb.style.display='none'}await loadDevices();ALL_EVENTS=await json('/api/v1/events?limit=300');renderEvents()}
 async function cycleClass(id,current){await json('/api/v1/devices/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({classification:CLASS_CYCLE[current]||'new'})});load()}
+function openDeviceEditById(id){const d=CURRENT_DEVICES.find(x=>x.id===id);if(d)openDeviceEdit(d)}
+async function openDeviceEdit(d){EDITING_DEVICE_ID=d.id;document.getElementById('deviceEditMac').textContent=d.mac+(d.ip?' · '+d.ip:'');document.getElementById('deviceEditName').value=d.name||'';document.getElementById('deviceEditType').value=d.device_type||'';document.getElementById('deviceEditClass').value=d.classification;document.getElementById('deviceEditNotes').value=d.notes||'';document.getElementById('deviceEditErr').textContent='';const hist=document.getElementById('deviceEditHistory');hist.innerHTML='<span class="muted">Loading…</span>';document.getElementById('deviceEditOverlay').style.display='grid';try{const events=await json('/api/v1/devices/'+d.id+'/events?limit=15');hist.innerHTML=events.length?events.map(e=>`<div style="padding:5px 0;border-bottom:1px solid #182335"><span class="muted">${esc(new Date(e.created_at).toLocaleString())}</span> — <span class="pill">${esc(e.event_type)}</span> ${esc(e.details||'')}</div>`).join(''):'<span class="muted">No recorded activity for this device yet.</span>'}catch(e){hist.innerHTML='<span class="muted">Could not load history.</span>'}}
+function closeDeviceEdit(){document.getElementById('deviceEditOverlay').style.display='none';EDITING_DEVICE_ID=null}
+async function saveDeviceEdit(e){e.preventDefault();if(!EDITING_DEVICE_ID)return false;const err=document.getElementById('deviceEditErr');err.textContent='';try{await json('/api/v1/devices/'+EDITING_DEVICE_ID,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('deviceEditName').value.trim(),device_type:document.getElementById('deviceEditType').value.trim(),classification:document.getElementById('deviceEditClass').value,notes:document.getElementById('deviceEditNotes').value})});closeDeviceEdit();await loadDevices()}catch(ex){err.textContent='Could not save changes — try again'}return false}
 async function scan(){await json('/api/v1/scan',{method:'POST'});updated.textContent='Scan requested…';setTimeout(load,3000)}
 async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';['navRules','navUsers','navAudit','navTools','navBackup','navLoginSec'].forEach(id=>{document.getElementById(id).style.display=ME.role==='admin'?'':'none'});const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}renderFilterBuilder('events');syncFilterControls('events');renderFilterBuilder('audit');syncFilterControls('audit');showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();await loadSavedFilters('events');if(ME.role==='admin'){await loadSavedFilters('audit');await loadLoginSecurity()}setInterval(load,10000)}
 boot();
