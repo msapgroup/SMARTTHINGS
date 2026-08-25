@@ -2,8 +2,9 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.16
+## Current release: 0.17
 
+- Device edit modal — rename, classify, set device type, and add notes for any device, including a view of its own recent activity history in the same panel
 - Login Security sidebar view — source-IP-to-account relationship graph and brute-force/credential-stuffing detection, built entirely over GODSEYE's own login audit trail
 - Network Tools sidebar section — ad-hoc ping and DNS lookup, admin only, strict input validation against injection
 - Backup & Export sidebar section — CSV export of devices/events, admin-only CSV audit export and full JSON backup (never includes credentials)
@@ -62,6 +63,14 @@
 <p>
   <img src="docs/screenshots/login-security.png" width="700" alt="Login Security view showing a source-to-account relationship graph and suspicious source table"><br>
   <em>Login Security - source IP to account relationship graph and brute-force/credential-stuffing detection over GODSEYE's own login audit trail</em>
+</p>
+
+These are real renders of the actual dashboard HTML/CSS/JavaScript shipped
+in `app/main.py`, served against realistic sample data rather than a live
+Raspberry Pi deployment - useful for seeing what the UI looks like without
+<p>
+  <img src="docs/screenshots/device-edit.png" width="500" alt="Device edit modal for renaming and classifying a device"><br>
+  <em>Rename, classify, and add notes to any device - including its recent activity history in the same view</em>
 </p>
 
 These are real renders of the actual dashboard HTML/CSS/JavaScript shipped
@@ -341,6 +350,21 @@ scrape_configs:
 
 With no token set, `/metrics` returns 404 rather than exposing device
 inventory data to anyone who can reach the port.
+
+## Device management
+
+Click **Edit** on any device row (admin only) to rename it, set a device
+type, change its classification, and add notes — including devices that
+showed up with no hostname and no vendor-guessable identity ("Unknown
+device" / "Unclassified"). The same modal shows that device's recent
+activity history (first seen, reconnects, disconnects), pulled from its
+own event trail so you don't have to cross-reference the Activity view
+to remember why a device looks familiar.
+
+The classification pill in the Devices table still supports the quick
+click-to-cycle behavior (new → known → ignored → investigate) for fast
+triage; the Edit modal is for when you want to actually name the thing
+and leave a note about what it is.
 
 ## Discovery methods
 
