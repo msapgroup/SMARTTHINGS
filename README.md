@@ -2,8 +2,9 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.17
+## Current release: 0.18
 
+- Delete devices from the inventory (Edit modal, admin only, with confirmation) — history is preserved, and the device is simply rediscovered fresh if it's still on the network
 - Device edit modal — rename, classify, set device type, and add notes for any device, including a view of its own recent activity history in the same panel
 - Login Security sidebar view — source-IP-to-account relationship graph and brute-force/credential-stuffing detection, built entirely over GODSEYE's own login audit trail
 - Network Tools sidebar section — ad-hoc ping and DNS lookup, admin only, strict input validation against injection
@@ -365,6 +366,15 @@ The classification pill in the Devices table still supports the quick
 click-to-cycle behavior (new → known → ignored → investigate) for fast
 triage; the Edit modal is for when you want to actually name the thing
 and leave a note about what it is.
+
+**Deleting a device** (also in the Edit modal, admin only) removes it
+from the inventory list, with a confirmation prompt first. It's a
+one-way action on the inventory entry, not a permanent ban: its past
+events stay in the Activity view as history, and if the device is still
+physically on the network, the next scan simply rediscovers it fresh (as
+a "new" device again). If you want a device to stop showing up as
+noteworthy without deleting it outright, classify it **ignored** instead
+— that's what that classification is for.
 
 ## Discovery methods
 

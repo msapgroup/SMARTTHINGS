@@ -382,7 +382,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.17.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.18.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1133,6 +1133,24 @@ def update_device(device_id: int, payload: DeviceUpdate, request: Request, admin
     return {"ok": True}
 
 
+@app.delete(f"{router_prefix}/devices/{{device_id}}")
+def delete_device(device_id: int, request: Request, admin=Depends(require_admin)):
+    # Removes the device from the inventory only - its recorded events stay
+    # in the Activity view as history. If it's still physically on the
+    # network, the next scan cycle will simply rediscover it as a new
+    # device again (nothing about deletion blocks that, on purpose - this
+    # isn't an ignore-forever action, that's what the "ignored"
+    # classification is for).
+    with db() as c:
+        device = c.execute("SELECT mac, name, hostname FROM devices WHERE id=?", (device_id,)).fetchone()
+        if not device:
+            raise HTTPException(404, "Device not found")
+        label = device["name"] or device["hostname"] or device["mac"]
+        c.execute("DELETE FROM devices WHERE id=?", (device_id,))
+        audit(c, admin["username"], "device_deleted", target=device["mac"], details=label, ip=client_ip(request))
+    return {"ok": True}
+
+
 @app.get(f"{router_prefix}/events")
 def events(limit: int = 100, severity: str | None = None, user=Depends(get_current_user)):
     limit = min(max(limit, 1), 500)
@@ -1516,6 +1534,7 @@ DASHBOARD = r'''<!doctype html>
         <button class="link" type="button" onclick="closeDeviceEdit()">Cancel</button>
       </div>
     </form>
+    <button class="danger" type="button" onclick="deleteDeviceFromEdit()" style="width:100%;margin-top:10px">Delete Device</button>
     <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:18px;padding-top:14px;border-top:1px solid #1d2838">Recent activity for this device</div>
     <div id="deviceEditHistory" style="margin-top:8px;max-height:180px;overflow:auto;font-size:12px"></div>
   </div>
@@ -1768,6 +1787,7 @@ function openDeviceEditById(id){const d=CURRENT_DEVICES.find(x=>x.id===id);if(d)
 async function openDeviceEdit(d){EDITING_DEVICE_ID=d.id;document.getElementById('deviceEditMac').textContent=d.mac+(d.ip?' · '+d.ip:'');document.getElementById('deviceEditName').value=d.name||'';document.getElementById('deviceEditType').value=d.device_type||'';document.getElementById('deviceEditClass').value=d.classification;document.getElementById('deviceEditNotes').value=d.notes||'';document.getElementById('deviceEditErr').textContent='';const hist=document.getElementById('deviceEditHistory');hist.innerHTML='<span class="muted">Loading…</span>';document.getElementById('deviceEditOverlay').style.display='grid';try{const events=await json('/api/v1/devices/'+d.id+'/events?limit=15');hist.innerHTML=events.length?events.map(e=>`<div style="padding:5px 0;border-bottom:1px solid #182335"><span class="muted">${esc(new Date(e.created_at).toLocaleString())}</span> — <span class="pill">${esc(e.event_type)}</span> ${esc(e.details||'')}</div>`).join(''):'<span class="muted">No recorded activity for this device yet.</span>'}catch(e){hist.innerHTML='<span class="muted">Could not load history.</span>'}}
 function closeDeviceEdit(){document.getElementById('deviceEditOverlay').style.display='none';EDITING_DEVICE_ID=null}
 async function saveDeviceEdit(e){e.preventDefault();if(!EDITING_DEVICE_ID)return false;const err=document.getElementById('deviceEditErr');err.textContent='';try{await json('/api/v1/devices/'+EDITING_DEVICE_ID,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('deviceEditName').value.trim(),device_type:document.getElementById('deviceEditType').value.trim(),classification:document.getElementById('deviceEditClass').value,notes:document.getElementById('deviceEditNotes').value})});closeDeviceEdit();await loadDevices()}catch(ex){err.textContent='Could not save changes — try again'}return false}
+async function deleteDeviceFromEdit(){if(!EDITING_DEVICE_ID)return;const d=CURRENT_DEVICES.find(x=>x.id===EDITING_DEVICE_ID);const label=d?(d.name||d.hostname||d.mac):'this device';if(!confirm('Delete "'+label+'"? This removes it from the inventory. If it\'s still on the network, it will simply show up again as a new device on the next scan.'))return;const err=document.getElementById('deviceEditErr');err.textContent='';try{await json('/api/v1/devices/'+EDITING_DEVICE_ID,{method:'DELETE'});closeDeviceEdit();await loadDevices()}catch(ex){err.textContent='Could not delete device — try again'}}
 async function scan(){await json('/api/v1/scan',{method:'POST'});updated.textContent='Scan requested…';setTimeout(load,3000)}
 async function boot(){try{ME=await json('/api/v1/auth/me')}catch(e){showLogin();return}whoami.textContent=ME.username+' ('+ME.role+')'+(ME.password_expires_in_days!==undefined?' · password expires in '+ME.password_expires_in_days+'d':'');scanBtn.style.display=ME.role==='admin'?'inline-block':'none';['navRules','navUsers','navAudit','navTools','navBackup','navLoginSec'].forEach(id=>{document.getElementById(id).style.display=ME.role==='admin'?'':'none'});const pwBar=document.getElementById('pwReminderBar');if(ME.password_change_reminder_days!==undefined){pwBar.textContent='⚠ Set a new password within '+ME.password_change_reminder_days+' day(s) — click here to do it now.';pwBar.style.display='block'}else{pwBar.style.display='none'}renderFilterBuilder('events');syncFilterControls('events');renderFilterBuilder('audit');syncFilterControls('audit');showApp();await load();await loadUsers();await loadAudit();await loadSecurity();await loadRules();await loadSavedFilters('events');if(ME.role==='admin'){await loadSavedFilters('audit');await loadLoginSecurity()}setInterval(load,10000)}
 boot();
