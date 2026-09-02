@@ -382,7 +382,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.18.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.19.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -871,6 +871,39 @@ def audit_log(limit: int = 200, admin=Depends(require_admin)):
     limit = min(max(limit, 1), 1000)
     with db() as c:
         return [dict(r) for r in c.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,))]
+
+
+class ClearAuditRequest(BaseModel):
+    current_password: str
+    older_than_days: int = 0
+
+
+@app.delete(f"{router_prefix}/audit")
+def clear_audit_log(payload: ClearAuditRequest, request: Request, admin=Depends(require_admin)):
+    # Requires re-entering the current password (same pattern as disabling
+    # MFA) since this is a significant, security-relevant action - a
+    # hijacked session shouldn't be able to do this on its own.
+    #
+    # This is retention-based, not just a blanket wipe: older_than_days=0
+    # clears everything, a positive value only clears entries older than
+    # that. Either way, the clear action itself is logged as a new
+    # audit_log entry immediately afterward, in the same transaction - the
+    # log can never be silently erased without leaving a record that a
+    # clear happened, who did it, and how much was removed.
+    with db() as c:
+        row = c.execute("SELECT password_salt, password_hash FROM users WHERE id=?", (admin["id"],)).fetchone()
+        if not verify_password(payload.current_password, row["password_salt"], row["password_hash"]):
+            raise HTTPException(401, "Current password is incorrect")
+        if payload.older_than_days and payload.older_than_days > 0:
+            cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=payload.older_than_days)).isoformat()
+            cur = c.execute("DELETE FROM audit_log WHERE created_at < ?", (cutoff,))
+            scope = f"entries older than {payload.older_than_days} day(s)"
+        else:
+            cur = c.execute("DELETE FROM audit_log")
+            scope = "all entries"
+        deleted_count = cur.rowcount
+        audit(c, admin["username"], "audit_log_cleared", details=f"{scope} ({deleted_count} removed)", ip=client_ip(request))
+    return {"ok": True, "deleted": deleted_count}
 
 
 # ---------------------------------------------------------------------------
@@ -1639,6 +1672,12 @@ DASHBOARD = r'''<!doctype html>
 </div>
 </section>
 <section class="panel" id="auditPanel"><h2>Audit Log</h2>
+<div style="padding:14px 18px;border-bottom:1px solid #1d2838;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+<input class="input" id="clearAuditDays" type="number" min="1" placeholder="Older than N days (blank = clear all)" style="max-width:230px">
+<input class="input" id="clearAuditPassword" type="password" placeholder="Your current password" style="max-width:200px" autocomplete="current-password">
+<button class="danger" onclick="clearAuditLog()">Clear Audit Log</button>
+<span class="muted" id="clearAuditErr" style="font-size:12px"></span>
+</div>
 <div style="overflow:auto"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th><th>IP</th></tr></thead><tbody id="auditRows"></tbody></table></div>
 </section>
 </div>
@@ -1768,6 +1807,7 @@ let CURRENT_DEVICES=[];
 async function loadDevices(){let q=new URLSearchParams();if(search.value)q.set('search',search.value);if(status.value)q.set('status',status.value);if(classification.value)q.set('classification',classification.value);let d=await json('/api/v1/devices?'+q);CURRENT_DEVICES=d;const canEdit=ME&&ME.role==='admin';devices.innerHTML=d.length?d.map(x=>`<tr><td class="${esc(x.status)}"><span class="dot">●</span> ${esc(x.status).replace('_',' ')}</td><td><div class="name">${esc(x.name||x.hostname||'Unknown device')}</div><div class="muted">${esc(x.device_type||'Unclassified')}</div></td><td>${esc(x.ip)}</td><td>${esc(x.mac)}</td><td>${esc(x.vendor||'—')}</td><td><button class="pill ${esc(x.classification)}" ${canEdit?`onclick="cycleClass(${x.id},'${x.classification}')"`:'disabled'}>${CLASS_LABEL[x.classification]||x.classification}</button></td><td>${canEdit?`<button class="link" onclick="openDeviceEditById(${x.id})">Edit</button>`:''}</td></tr>`).join(''):'<tr><td colspan="7" class="empty">No devices match this filter.</td></tr>'}
 async function loadUsers(){if(!ME||ME.role!=='admin'){usersPanel.style.display='none';return}usersPanel.style.display='block';let u=await json('/api/v1/users');users.innerHTML=u.map(x=>{let mustChange=x.must_change_password?(x.must_change_password_by?`yes, by ${esc(new Date(x.must_change_password_by).toLocaleDateString())}`:'yes'):'no';return `<tr><td>${esc(x.username)}</td><td><span class="pill ${esc(x.role)}">${esc(x.role)}</span></td><td>${esc(new Date(x.created_at).toLocaleDateString())}</td><td>${x.last_login_at?esc(new Date(x.last_login_at).toLocaleString()):'never'}</td><td>${x.password_changed_at?esc(new Date(x.password_changed_at).toLocaleDateString()):'—'}</td><td>${mustChange}</td><td>${x.mfa_enabled?'yes':'no'}</td><td>${x.username===ME.username?'':`<button class="link" onclick="removeUser(${x.id},'${esc(x.username)}')">Remove</button>${x.mfa_enabled?` <button class="link" onclick="resetUserMfa(${x.id},'${esc(x.username)}')">Reset MFA</button>`:''}`}</td></tr>`}).join('')}
 async function loadAudit(){if(!ME||ME.role!=='admin'){auditPanel.style.display='none';return}auditPanel.style.display='block';ALL_AUDIT=await json('/api/v1/audit?limit=300');renderAudit()}
+async function clearAuditLog(){const daysRaw=document.getElementById('clearAuditDays').value.trim();const days=daysRaw?parseInt(daysRaw,10):0;const password=document.getElementById('clearAuditPassword').value;const errEl=document.getElementById('clearAuditErr');errEl.textContent='';if(!password){errEl.textContent='Enter your password to confirm';return}const scopeText=days>0?('entries older than '+days+' day(s)'):'the ENTIRE audit log';if(!confirm('Clear '+scopeText+'? This cannot be undone — though a record that the log was cleared will remain.'))return;try{const r=await json('/api/v1/audit',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:password,older_than_days:days})});document.getElementById('clearAuditPassword').value='';document.getElementById('clearAuditDays').value='';errEl.style.color='#50e3a4';errEl.textContent=r.deleted+' entries cleared.';await loadAudit()}catch(e){errEl.style.color='';errEl.textContent='Could not clear audit log — check your password'}}
 async function loadSecurity(){const el=document.getElementById('mfaStatus');if(ME.mfa_enabled){el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#50e3a4">enabled</b> on this account.</div><button class="link" style="margin-top:10px" onclick="startMfaDisable()">Disable MFA</button>`}else{el.innerHTML=`<div class="muted">Two-factor authentication is <b style="color:#f7c948">not enabled</b>. Add it for a second layer of protection beyond your password.</div><button class="primary" style="margin-top:10px" onclick="startMfaSetup()">Set up MFA</button>`}}
 function updateRuleFields(){const t=document.getElementById('ruleType').value;document.getElementById('ruleFieldsBurst').style.display=t==='new_device_burst'?'flex':'none';document.getElementById('ruleFieldsOffline').style.display=t==='offline_duration'?'flex':'none'}
 async function loadRules(){if(!ME||ME.role!=='admin'){rulesPanel.style.display='none';return}rulesPanel.style.display='block';let r=await json('/api/v1/rules');rules.innerHTML=r.length?r.map(x=>{let p;try{p=JSON.parse(x.params)}catch(e){p={}}let cond=x.rule_type==='new_device_burst'?`${p.count}+ new devices in ${p.window_minutes}m`:`offline ${p.minutes}m+ (${(p.classifications&&p.classifications.length?p.classifications:['any']).join(', ')})`;return `<tr><td>${esc(x.name)}</td><td>${esc(x.rule_type)}</td><td>${esc(cond)}</td><td><span class="pill ${esc(x.severity)}">${esc(x.severity)}</span></td><td>${x.last_triggered_at?esc(new Date(x.last_triggered_at).toLocaleString()):'never'}</td><td><input type="checkbox" ${x.enabled?'checked':''} onchange="toggleRule(${x.id},this.checked)"></td><td><button class="link" onclick="removeRule(${x.id},'${esc(x.name)}')">Remove</button></td></tr>`}).join(''):'<tr><td colspan="7" class="empty">No rules configured yet.</td></tr>'}

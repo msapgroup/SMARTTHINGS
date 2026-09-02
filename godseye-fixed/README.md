@@ -2,8 +2,9 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.18
+## Current release: 0.19
 
+- Clear Audit Log (retention-based, admin only) — clear everything or just entries older than N days, password-confirmed, and the clear action itself is always logged so the trail can never be silently erased
 - Delete devices from the inventory (Edit modal, admin only, with confirmation) — history is preserved, and the device is simply rediscovered fresh if it's still on the network
 - Device edit modal — rename, classify, set device type, and add notes for any device, including a view of its own recent activity history in the same panel
 - Login Security sidebar view — source-IP-to-account relationship graph and brute-force/credential-stuffing detection, built entirely over GODSEYE's own login audit trail
@@ -375,6 +376,23 @@ physically on the network, the next scan simply rediscovers it fresh (as
 a "new" device again). If you want a device to stop showing up as
 noteworthy without deleting it outright, classify it **ignored** instead
 — that's what that classification is for.
+
+## Clearing the audit log
+
+The Audit Log view (admin only, 0.19) has retention controls for
+managing its size over time — clear everything, or just entries older
+than N days. This is deliberately **not** a free wipe:
+
+- Clearing requires re-entering your current password, the same pattern
+  used for disabling MFA — a hijacked session cookie alone can't do this.
+- The clear action is itself logged as a new audit entry, written
+  *after* the deletion, recording who cleared it, how much was removed,
+  and the scope (all, or older-than-N-days). The audit log can never be
+  silently erased without leaving a record that it happened.
+- Clearing entries also removes them from what the Login Security view
+  can analyze — that feature's brute-force/credential-stuffing detection
+  depends on this same audit history. If you still want that visibility,
+  prefer clearing "older than N days" over a full wipe.
 
 ## Discovery methods
 
