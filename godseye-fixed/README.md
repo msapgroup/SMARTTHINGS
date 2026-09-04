@@ -2,8 +2,9 @@
 
 **GODSEYE** is a lightweight, local-first Raspberry Pi 4 network intelligence and monitoring appliance inspired by Pi.Alert.
 
-## Current release: 0.19
+## Current release: 0.20
 
+- Per-entry audit log deletion — remove a single entry directly from its row, password-confirmed, self-logging, with trace entries protected from deletion to close the cascading-cover-up loophole
 - Clear Audit Log (retention-based, admin only) — clear everything or just entries older than N days, password-confirmed, and the clear action itself is always logged so the trail can never be silently erased
 - Delete devices from the inventory (Edit modal, admin only, with confirmation) — history is preserved, and the device is simply rediscovered fresh if it's still on the network
 - Device edit modal — rename, classify, set device type, and add notes for any device, including a view of its own recent activity history in the same panel
@@ -381,18 +382,26 @@ noteworthy without deleting it outright, classify it **ignored** instead
 
 The Audit Log view (admin only, 0.19) has retention controls for
 managing its size over time — clear everything, or just entries older
-than N days. This is deliberately **not** a free wipe:
+than N days. As of 0.20, you can also delete a single entry directly
+from its row. Both are deliberately **not** a free wipe:
 
-- Clearing requires re-entering your current password, the same pattern
-  used for disabling MFA — a hijacked session cookie alone can't do this.
-- The clear action is itself logged as a new audit entry, written
-  *after* the deletion, recording who cleared it, how much was removed,
-  and the scope (all, or older-than-N-days). The audit log can never be
-  silently erased without leaving a record that it happened.
-- Clearing entries also removes them from what the Login Security view
-  can analyze — that feature's brute-force/credential-stuffing detection
-  depends on this same audit history. If you still want that visibility,
-  prefer clearing "older than N days" over a full wipe.
+- Either action requires re-entering your current password, the same
+  pattern used for disabling MFA — a hijacked session cookie alone can't
+  do this.
+- Both actions are themselves logged as a new audit entry, written
+  *after* the deletion, recording who did it and what was removed (for a
+  single entry: which action, actor, and timestamp it was). The audit
+  log can never be silently erased without leaving a record that it
+  happened.
+- Those trace entries (`audit_log_cleared`, `audit_entry_deleted`) can't
+  themselves be deleted — otherwise someone could delete the evidence of
+  deleting evidence, cascading their way to a genuinely clean slate. The
+  log can shrink, but it can't lose the record that it shrank.
+- Clearing/deleting entries also removes them from what the Login
+  Security view can analyze — that feature's brute-force/credential-
+  stuffing detection depends on this same audit history. If you still
+  want that visibility, prefer clearing "older than N days" over a full
+  wipe, and use per-entry deletion sparingly.
 
 ## Discovery methods
 

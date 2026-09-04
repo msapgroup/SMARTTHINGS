@@ -382,7 +382,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="GODSEYE", version="0.19.0", lifespan=lifespan)
+app = FastAPI(title="GODSEYE", version="0.20.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -904,6 +904,36 @@ def clear_audit_log(payload: ClearAuditRequest, request: Request, admin=Depends(
         deleted_count = cur.rowcount
         audit(c, admin["username"], "audit_log_cleared", details=f"{scope} ({deleted_count} removed)", ip=client_ip(request))
     return {"ok": True, "deleted": deleted_count}
+
+
+# Trace entries record that a clear/delete happened; letting someone
+# delete those too would let them cascade their way to a genuinely clean
+# slate (delete the evidence of deleting evidence). These stay
+# permanent - the log can shrink, but never lose the record that it shrank.
+_AUDIT_TRACE_ACTIONS = {"audit_log_cleared", "audit_entry_deleted"}
+
+
+class DeleteAuditEntryRequest(BaseModel):
+    current_password: str
+
+
+@app.delete(f"{router_prefix}/audit/{{entry_id}}")
+def delete_audit_entry(entry_id: int, payload: DeleteAuditEntryRequest, request: Request, admin=Depends(require_admin)):
+    with db() as c:
+        row = c.execute("SELECT password_salt, password_hash FROM users WHERE id=?", (admin["id"],)).fetchone()
+        if not verify_password(payload.current_password, row["password_salt"], row["password_hash"]):
+            raise HTTPException(401, "Current password is incorrect")
+        entry = c.execute("SELECT * FROM audit_log WHERE id=?", (entry_id,)).fetchone()
+        if not entry:
+            raise HTTPException(404, "Audit log entry not found")
+        if entry["action"] in _AUDIT_TRACE_ACTIONS:
+            raise HTTPException(403, "This entry records a previous audit log clear/delete and cannot be removed")
+        c.execute("DELETE FROM audit_log WHERE id=?", (entry_id,))
+        summary = f"removed: {entry['action']} by {entry['actor']} at {entry['created_at']}"
+        if entry["target"]:
+            summary += f" (target={entry['target']})"
+        audit(c, admin["username"], "audit_entry_deleted", target=str(entry_id), details=summary, ip=client_ip(request))
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1678,7 +1708,7 @@ DASHBOARD = r'''<!doctype html>
 <button class="danger" onclick="clearAuditLog()">Clear Audit Log</button>
 <span class="muted" id="clearAuditErr" style="font-size:12px"></span>
 </div>
-<div style="overflow:auto"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th><th>IP</th></tr></thead><tbody id="auditRows"></tbody></table></div>
+<div style="overflow:auto"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th><th>IP</th><th></th></tr></thead><tbody id="auditRows"></tbody></table></div>
 </section>
 </div>
 
@@ -1762,7 +1792,8 @@ function setMode(target,val){FILTER_STATE[target].mode=val;applyAndRender(target
 function clearFilter(target){FILTER_STATE[target]={conditions:[],join:'AND',mode:'include',highlights:[]};renderFilterBuilder(target);syncFilterControls(target);applyAndRender(target)}
 function applyAndRender(target){if(target==='events')renderEvents();else renderAudit()}
 function renderEvents(){const state=FILTER_STATE.events;const filtered=applyFilterRows(ALL_EVENTS,state);events.innerHTML=filtered.length?filtered.map(x=>{const hl=highlightColor(x,state);const style=hl?` style="background:${hl}22;border-left:3px solid ${hl}"`:'';return `<tr${style}><td>${esc(new Date(x.created_at).toLocaleString())}</td><td><span class="pill">${esc(x.event_type)}</span></td><td>${esc(x.mac||'—')}</td><td>${esc(x.ip||'—')}</td><td>${esc(x.details)}</td></tr>`}).join(''):'<tr><td colspan="5" class="empty">No activity matches this filter.</td></tr>';const c=document.getElementById('eventsMatchCount');if(c)c.textContent=filtered.length+' / '+ALL_EVENTS.length+' shown'}
-function renderAudit(){const state=FILTER_STATE.audit;const filtered=applyFilterRows(ALL_AUDIT,state);auditRows.innerHTML=filtered.length?filtered.map(x=>{const hl=highlightColor(x,state);const style=hl?` style="background:${hl}22;border-left:3px solid ${hl}"`:'';return `<tr${style}><td>${esc(new Date(x.created_at).toLocaleString())}</td><td>${esc(x.actor)}</td><td><span class="pill">${esc(x.action)}</span></td><td>${esc(x.target||'—')}</td><td>${esc(x.details||'')}</td><td>${esc(x.ip||'—')}</td></tr>`}).join(''):'<tr><td colspan="6" class="empty">No audit entries match this filter.</td></tr>';const c=document.getElementById('auditMatchCount');if(c)c.textContent=filtered.length+' / '+ALL_AUDIT.length+' shown'}
+function renderAudit(){const state=FILTER_STATE.audit;const filtered=applyFilterRows(ALL_AUDIT,state);const TRACE_ACTIONS=['audit_log_cleared','audit_entry_deleted'];auditRows.innerHTML=filtered.length?filtered.map(x=>{const hl=highlightColor(x,state);const style=hl?` style="background:${hl}22;border-left:3px solid ${hl}"`:'';const isTrace=TRACE_ACTIONS.includes(x.action);return `<tr${style}><td>${esc(new Date(x.created_at).toLocaleString())}</td><td>${esc(x.actor)}</td><td><span class="pill">${esc(x.action)}</span></td><td>${esc(x.target||'—')}</td><td>${esc(x.details||'')}</td><td>${esc(x.ip||'—')}</td><td>${isTrace?'':`<button class="link" onclick="deleteAuditEntry(${x.id},'${esc(x.action)}')">Delete</button>`}</td></tr>`}).join(''):'<tr><td colspan="7" class="empty">No audit entries match this filter.</td></tr>';const c=document.getElementById('auditMatchCount');if(c)c.textContent=filtered.length+' / '+ALL_AUDIT.length+' shown'}
+async function deleteAuditEntry(id,actionLabel){if(!confirm('Delete this audit entry ('+actionLabel+')? This action is itself logged and cannot be undone.'))return;const password=prompt('Enter your password to confirm:');if(!password)return;try{await json('/api/v1/audit/'+id,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:password})});await loadAudit()}catch(e){alert('Could not delete entry — check your password and try again')}}
 async function loadSavedFilters(target){try{SAVED_FILTERS[target]=await json('/api/v1/saved-filters?target='+target)}catch(e){SAVED_FILTERS[target]=[]}renderSavedFilters(target)}
 function renderSavedFilters(target){const el=document.getElementById('savedFilters-'+target);const list=SAVED_FILTERS[target];el.innerHTML=list.length?list.map(f=>`<span class="pill savedFilterChip"><span onclick="applySavedFilter('${target}',${f.id})">${esc(f.name)}</span> <span onclick="deleteSavedFilter('${target}',${f.id})" style="color:#ff8194">✕</span></span>`).join(' '):'<span class="muted">No saved filters yet.</span>'}
 function applySavedFilter(target,id){const f=SAVED_FILTERS[target].find(x=>x.id===id);if(!f)return;let def;try{def=JSON.parse(f.definition)}catch(e){return}FILTER_STATE[target]=Object.assign({conditions:[],join:'AND',mode:'include',highlights:[]},def);renderFilterBuilder(target);syncFilterControls(target);applyAndRender(target)}
